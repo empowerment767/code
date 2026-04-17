@@ -24,7 +24,7 @@ from telegram.ext import (
 # ===== TOKENS =====
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8610501182:AAF_w5tOE446-4DaXJztk2dlh13rcX526Kk")
 GROQ_API_KEY   = os.environ.get("GROQ_API_KEY",   "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")
-WEBHOOK_HOST   = os.environ.get("bot_1776344299_7405_bronson.bothost.tech")
+WEBHOOK_HOST   = os.environ.get("code-dun-tau.vercel.app")
 
 # ===== BOTHOST.RU CONFIG =====
 # Задаётся в панели bothost.ru → Переменные окружения
