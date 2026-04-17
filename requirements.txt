@@ -1,0 +1,8 @@
+python-telegram-bot[webhooks]>=20.0
+openai>=1.30.0
+flask
+gunicorn
+pillow
+rembg
+yt-dlp
+httpx>=0.28.1
