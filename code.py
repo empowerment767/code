@@ -1,5 +1,4 @@
 import asyncio
-import concurrent.futures
 import http.cookiejar as _cookiejar
 import io
 import json
@@ -13,9 +12,7 @@ import zipfile
 from datetime import datetime, timezone
 from openai import OpenAI
 from PIL import Image
-import instaloader
 import yt_dlp
-from duckduckgo_search import DDGS
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -26,16 +23,6 @@ from telegram.ext import (
 # ===== TOKENS =====
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8610501182:AAF_w5tOE446-4DaXJztk2dlh13rcX526Kk")
 GROQ_API_KEY   = os.environ.get("GROQ_API_KEY",   "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")
-
-# ===== YOUTUBE COOKIES =====
-_YT_COOKIE_FILE: str | None = None
-_yt_cookies_raw = os.environ.get("YOUTUBE_COOKIES", "")
-if _yt_cookies_raw.strip():
-    _cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-    with open(_cookie_path, "w", encoding="utf-8") as _cf:
-        _cf.write(_yt_cookies_raw)
-    _YT_COOKIE_FILE = _cookie_path
-    print(f"✅ YouTube cookies loaded ({len(_yt_cookies_raw)} bytes)", flush=True)
 
 # ===== GROQ CLIENT =====
 groq_client = OpenAI(
@@ -98,21 +85,19 @@ SOUNDCLOUD_RE = re.compile(
 DEEZER_RE = re.compile(
     r'https?://(?:www\.)?deezer\.com/(?:\w+/)?(?:track|album|playlist)/\d+'
 )
-INSTAGRAM_RE = re.compile(
-    r'https?://(?:www\.)?instagram\.com/([A-Za-z0-9_.]+)/?(?:\?[^\s]*)?(?:\s|$)',
-    re.IGNORECASE,
-)
-
-# ===== INSTAGRAM CREDENTIALS =====
-_IG_USER = os.environ.get("INSTAGRAM_USERNAME", "")
-_IG_PASS = os.environ.get("INSTAGRAM_PASSWORD", "")
 
 # Telegram bot file size limit: 50 MB
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
-# Global thread pool — shared across all blocking I/O and CPU tasks
-_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=20, thread_name_prefix="bot"
+
+# ===== WEATHER KEYWORDS =====
+WEATHER_RE = re.compile(
+    r'\b(?:weather|погода[а-яё]*|прогноз|температур[а-яё]*|climate)\b',
+    re.IGNORECASE
+)
+CITY_RE = re.compile(
+    r'(?:в|in|для|for|во)\s+([А-ЯЁа-яёA-Za-z][а-яёa-z\-A-Za-z\s]{1,30}?)(?:\s*[?,.]|$)',
+    re.IGNORECASE
 )
 
 
@@ -121,28 +106,47 @@ def get_current_datetime() -> str:
     return now.strftime("Текущая дата и время (UTC): %d.%m.%Y %H:%M")
 
 
-_CJK_RE = re.compile(
-    r'[\u2E80-\u2EFF\u2F00-\u2FDF\u3000-\u303F\u3040-\u309F\u30A0-\u30FF'
-    r'\u3100-\u312F\u3200-\u32FF\u3300-\u33FF\u3400-\u4DBF\u4E00-\u9FFF'
-    r'\uF900-\uFAFF\uFE30-\uFE4F\U00020000-\U0002A6DF\U0002A700-\U0002CEAF]'
-)
+def fetch_weather(city: str) -> str:
+    city = city.strip()
+    encoded = urllib.parse.quote(city)
+    url = f"https://wttr.in/{encoded}?format=j1"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        cur = data["current_condition"][0]
+        desc_list = cur.get("lang_ru") or cur.get("weatherDesc") or [{"value": ""}]
+        desc = desc_list[0]["value"]
+        temp     = cur["temp_C"]
+        feels    = cur["FeelsLikeC"]
+        humidity = cur["humidity"]
+        wind     = cur["windspeedKmph"]
+        return (
+            f"[Реальная погода в {city}: {desc}, "
+            f"температура {temp}°C (ощущается {feels}°C), "
+            f"влажность {humidity}%, ветер {wind} км/ч]"
+        )
+    except Exception:
+        return ""
 
-def _strip_cjk(text: str) -> str:
-    """Remove CJK (Chinese/Japanese/Korean) characters from text."""
-    return _CJK_RE.sub('', text)
+
+def extract_city(text: str) -> str:
+    m = CITY_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    return ""
 
 
 def build_system_prompt(extra: str = "") -> str:
     base = (
         get_current_datetime() + ".\n\n"
-        "Ты — конкретный чувак, не робот и не ассистент. Общаешься жёстко и по-простому, без всякого пафоса. "
-        "Материшься свободно и часто — блять, хуй, пиздец, нахуй, ёбаный, хуёво, заебись — используй их естественно в речи, "
-        "как обычный русский мужик разговаривает с корешем. Не стесняйся, не цензуришь себя. "
-        "Никогда не говоришь что ты ИИ или бот, не извиняешься за мат, никаких дисклеймеров и предупреждений. "
-        "Мнение высказываешь прямо и резко. Можешь послать, подколоть, пошутить грубо. "
-        "Пишешь ТОЛЬКО обычным русским текстом — никаких escape-последовательностей, никаких \\u символов, "
-        "никакой кодировки в тексте — только живые русские слова. "
-        "При вопросах о текущей дате или времени — используй данные выше."
+        "Ты — живой чувак, не робот и не ассистент. Общаешься как реальный человек: "
+        "по-простому, без пафоса, иногда грубовато. Используешь матерные слова там, где это уместно — "
+        "естественно, не через каждое слово, а как обычный русскоязычный человек в разговоре с другом. "
+        "Никогда не говоришь что ты ИИ или бот, не извиняешься за мат, не добавляешь дисклеймеры. "
+        "Мнение своё высказываешь прямо. Можешь подколоть, пошутить, поспорить. "
+        "При вопросах о текущей дате или времени — используй данные выше. "
+        "При вопросах о погоде — используй данные ниже, если они есть."
     )
     if extra:
         base += "\n" + extra
@@ -173,7 +177,7 @@ def ask_groq(user_id, prompt, system_extra: str = ""):
         messages=messages
     )
 
-    answer = _strip_cjk(response.choices[0].message.content)
+    answer = response.choices[0].message.content
     history.append({"role": "assistant", "content": answer})
     with _memory_lock:
         user_memory[user_id] = history[-10:]
@@ -182,17 +186,8 @@ def ask_groq(user_id, prompt, system_extra: str = ""):
 
 # ===== FONT DOWNLOAD =====
 
-FONT_RE          = re.compile(r'^шрифт\s+(.+)$', re.IGNORECASE)
-MUSIC_RE         = re.compile(r'^музыка\s+(.+)$', re.IGNORECASE)
-VIDEO_SEARCH_RE  = re.compile(
-    r'^(?:'
-    r'(?:найди|пришли|скачай|покажи|хочу\s+(?:посмотреть|увидеть))\s+(?:видео|ролик|клип|трейлер)\s+(.+)'
-    r'|(?:видео|ролик|трейлер)\s+(.+)'
-    r')$',
-    re.IGNORECASE | re.DOTALL
-)
-# Catch bare "видео" / "ролик" / "трейлер" with no query
-VIDEO_BARE_RE = re.compile(r'^(видео|ролик|трейлер|клип)$', re.IGNORECASE)
+FONT_RE     = re.compile(r'^шрифт\s+(.+)$', re.IGNORECASE)
+MUSIC_RE    = re.compile(r'^музыка\s+(.+)$', re.IGNORECASE)
 
 # Regex to detect "fetch media from internet" intent (pre-filter before Groq classification)
 INTERNET_RE = re.compile(
@@ -218,6 +213,123 @@ PHOTO_GUIDE_RE = re.compile(
     r'\b(как|how).{0,80}\b(картинк|фото|пошагово|по шагам|step.?by.?step|инструкц|схем)',
     re.IGNORECASE | re.DOTALL,
 )
+# Catch radio requests: "радио джаз", "включи рок радио", "радио с классикой"
+RADIO_RE = re.compile(
+    r'\b(?:'
+    r'радио\b.{0,60}'
+    r'|radio\b.{0,60}'
+    r'|включи\b.{0,40}(?:радио|music|музык)'
+    r'|поставь\b.{0,40}(?:радио|музык)'
+    r'|хочу\s+(?:послушать|слушать)\s+радио'
+    r')',
+    re.IGNORECASE,
+)
+
+# Genre → search queries on YouTube (long mixes / radio shows)
+RADIO_QUERIES: dict[str, list[str]] = {
+    # ── Разговорные / общие ───────────────────────────────────────────────────
+    "поп":          ["pop music radio mix 2024 playlist", "pop hits radio"],
+    "pop":          ["pop music radio mix 2024 playlist", "pop hits radio"],
+    "топ":          ["top hits radio mix 2024", "best hits radio"],
+    # ── Рок ──────────────────────────────────────────────────────────────────
+    "рок":          ["classic rock radio mix", "rock music radio 2024"],
+    "rock":         ["classic rock radio mix", "rock music radio 2024"],
+    "хардрок":      ["hard rock music radio mix", "hard rock radio"],
+    "hard rock":    ["hard rock music radio mix", "hard rock radio"],
+    "металл":       ["heavy metal radio mix", "metal music radio"],
+    "метал":        ["heavy metal radio mix", "metal music radio"],
+    "metal":        ["heavy metal radio mix", "metal music radio"],
+    "панк":         ["punk rock radio mix", "punk music radio"],
+    "punk":         ["punk rock radio mix", "punk music radio"],
+    "альтернатива": ["alternative rock radio mix", "alternative music radio"],
+    "alternative":  ["alternative rock radio mix", "alternative music radio"],
+    "инди":         ["indie rock radio mix", "indie music radio"],
+    "indie":        ["indie rock radio mix", "indie music radio"],
+    # ── Джаз / блюз / соул ───────────────────────────────────────────────────
+    "джаз":         ["jazz radio lounge mix", "smooth jazz music radio"],
+    "jazz":         ["jazz radio lounge mix", "smooth jazz music radio"],
+    "блюз":         ["blues music radio mix", "blues radio"],
+    "blues":        ["blues music radio mix", "blues radio"],
+    "соул":         ["soul music radio mix", "soul r&b radio"],
+    "soul":         ["soul music radio mix", "soul r&b radio"],
+    "rnb":          ["r&b soul radio mix", "rnb music radio 2024"],
+    "р н б":        ["r&b soul radio mix", "rnb music radio 2024"],
+    "фанк":         ["funk music radio mix", "funky radio"],
+    "funk":         ["funk music radio mix", "funky radio"],
+    # ── Электронная / танцевальная ────────────────────────────────────────────
+    "электронная":  ["electronic music radio mix", "electronic radio"],
+    "электро":      ["electronic music radio mix", "electro radio mix"],
+    "electronic":   ["electronic music radio mix", "electronic radio"],
+    "house":        ["house music radio mix", "house radio 2024"],
+    "хаус":         ["house music radio mix", "house radio 2024"],
+    "техно":        ["techno music radio mix", "techno radio"],
+    "techno":       ["techno music radio mix", "techno radio"],
+    "транс":        ["trance music radio mix", "trance radio"],
+    "trance":       ["trance music radio mix", "trance radio"],
+    "edm":          ["edm radio mix 2024", "electronic dance music radio"],
+    "драм":         ["drum and bass radio mix", "dnb radio"],
+    "dnb":          ["drum and bass radio mix", "dnb radio"],
+    "дабстеп":      ["dubstep radio mix", "dubstep music radio"],
+    "dubstep":      ["dubstep radio mix", "dubstep music radio"],
+    "амбиент":      ["ambient music radio mix", "ambient chill radio"],
+    "ambient":      ["ambient music radio mix", "ambient chill radio"],
+    "чилл":         ["chill music radio mix", "chill out lounge radio"],
+    "chill":        ["chill music radio mix", "chill out lounge radio"],
+    "лаунж":        ["lounge music radio mix", "lounge bar music radio"],
+    "lounge":       ["lounge music radio mix", "lounge bar music radio"],
+    # ── Рэп / хип-хоп ────────────────────────────────────────────────────────
+    "рэп":          ["rap hip hop radio mix", "rap music radio 2024"],
+    "rap":          ["rap hip hop radio mix", "rap music radio 2024"],
+    "хип-хоп":      ["hip hop radio mix", "hip hop music radio"],
+    "хипхоп":       ["hip hop radio mix", "hip hop music radio"],
+    "hip hop":      ["hip hop radio mix", "hip hop music radio"],
+    "хип хоп":      ["hip hop radio mix", "hip hop music radio"],
+    "трэп":         ["trap music radio mix", "trap radio 2024"],
+    "trap":         ["trap music radio mix", "trap radio 2024"],
+    # ── Классическая ─────────────────────────────────────────────────────────
+    "классика":     ["classical music radio", "classical music radio 2024"],
+    "классическая": ["classical music radio", "classical radio mix"],
+    "classical":    ["classical music radio", "classical radio mix"],
+    "опера":        ["opera music radio", "classical opera radio mix"],
+    "opera":        ["opera music radio", "classical opera radio mix"],
+    "оркестр":      ["orchestral music radio", "orchestra classical radio"],
+    "пианино":      ["piano music radio mix", "relaxing piano radio"],
+    "piano":        ["piano music radio mix", "relaxing piano radio"],
+    # ── Народная / региональная ───────────────────────────────────────────────
+    "фолк":         ["folk music radio mix", "folk radio"],
+    "folk":         ["folk music radio mix", "folk radio"],
+    "кантри":       ["country music radio mix", "country radio"],
+    "country":      ["country music radio mix", "country radio"],
+    "регги":        ["reggae music radio mix", "reggae radio"],
+    "reggae":       ["reggae music radio mix", "reggae radio"],
+    "латин":        ["latin music radio mix", "latin pop radio"],
+    "latin":        ["latin music radio mix", "latin pop radio"],
+    "латинская":    ["latin music radio mix", "latin radio"],
+    "бразильская":  ["brazilian music radio mix", "bossa nova radio"],
+    "русская":      ["russian pop music radio", "русская музыка радио"],
+    "русский рок":  ["russian rock music radio", "русский рок радио"],
+    # ── Настроение ───────────────────────────────────────────────────────────
+    "релакс":       ["relaxing music radio mix", "relax music radio"],
+    "relax":        ["relaxing music radio mix", "relax music radio"],
+    "медитация":    ["meditation music radio", "meditation relax radio"],
+    "meditation":   ["meditation music radio", "meditation relax radio"],
+    "для сна":      ["sleep music radio mix", "relaxing sleep music radio"],
+    "sleep":        ["sleep music radio mix", "relaxing sleep music radio"],
+    "романтика":    ["romantic music radio mix", "romantic love songs radio"],
+    "romantic":     ["romantic music radio mix", "romantic love songs radio"],
+    "вечеринка":    ["party music radio mix", "party hits radio"],
+    "party":        ["party music radio mix", "party hits radio"],
+    "спорт":        ["workout music radio mix", "sport training music radio"],
+    "workout":      ["workout music radio mix", "sport training music radio"],
+    "фоновая":      ["background music radio mix", "focus study music radio"],
+    "фон":          ["background music radio mix", "focus study music radio"],
+    "учеба":        ["study music radio mix", "focus study lofi radio"],
+    "lofi":         ["lofi hip hop radio mix", "lofi beats radio"],
+    "лофи":         ["lofi hip hop radio mix", "lofi beats radio"],
+    "фонк":         ["phonk music radio mix", "phonk drift radio", "dark phonk mix"],
+    "phonk":        ["phonk music radio mix", "phonk drift radio", "dark phonk mix"],
+    "dark phonk":   ["dark phonk music radio", "phonk radio mix"],
+}
 
 # Catch image search requests: "покажи кота", "найди фото моря", "картинку котика"
 IMAGE_RE = re.compile(
@@ -273,6 +385,7 @@ INFO_RE = re.compile(
     r'|режим\s+работы\b|часы\s+работы\b|график\s+работы\b'
     r'|где\s+(?:купить|найти|заказать|находится|расположен\w*)\b'
     r'|открыт\w*\s+ли\b|работает\s+ли\b'
+    r'|погода\s+(?:сейчас|завтра|на\s+неделю)\b'
     r'|курс\s+(?:доллара|евро|рубля|валют)\b'
     r'|новости\s+(?:о|про|по|в)\b'
     r'|последние\s+новости\b'
@@ -396,7 +509,9 @@ def search_web_info(text: str) -> tuple[str | None, str]:
     Returns (answer_text or None, image_search_query or "").
     """
     try:
-        ddgs = DDGS()
+        from duckduckgo_search import DDGS as _DDGS
+
+        ddgs = _DDGS()
 
         # Run two searches: original query + region-aware variant
         results = list(ddgs.text(text, max_results=10))
@@ -677,411 +792,54 @@ def _kp_find_film_id(query: str) -> tuple[str, str] | None:
     return None
 
 
-# YouTube clients that don't require cookies/sign-in (most reliable first)
-# tv_embedded: most formats; android variants: bypass bot-detection better
-_YT_CLIENTS = ["tv_embedded", "android_embedded", "android_vr", "android"]
-
-_IS_YT_URL = re.compile(r'youtube\.com|youtu\.be', re.IGNORECASE)
-
-_YT_BOT_ERRORS = ("sign in", "bot", "429", "confirm", "cookies", "age")
-
-
 def _download_video_url(url: str, title_fallback: str = "") -> tuple[bytes, str]:
     """Download a video from any yt-dlp supported URL. Returns (bytes, title)."""
     import subprocess
-
-    is_yt = bool(_IS_YT_URL.search(url))
-    clients_to_try = _YT_CLIENTS if is_yt else [None]
-
-    formats = [
-        "best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/best",
-        "worst[ext=mp4]/worst",
-    ]
-
-    for client in clients_to_try:
-        client_failed_with_auth = False
-        for fmt in formats:
-            try:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    extra = {
-                        "format": fmt,
-                        "outtmpl": os.path.join(tmpdir, "video.%(ext)s"),
-                        "noplaylist": True,
-                        "merge_output_format": "mp4",
-                    }
-                    if client:
-                        extra["extractor_args"] = {"youtube": {"player_client": [client]}}
-                    opts = _base_opts(tmpdir, extra)
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                    filepath = _find_file(tmpdir, preferred_ext=".mp4")
-                    size = os.path.getsize(filepath)
-                    if size > MAX_FILE_SIZE:
-                        small_path = os.path.join(tmpdir, "small.mp4")
-                        r = subprocess.run(
-                            ["ffmpeg", "-y", "-i", filepath,
-                             "-vf", "scale=-2:480", "-c:v", "libx264",
-                             "-crf", "28", "-preset", "fast",
-                             "-c:a", "aac", "-b:a", "96k", small_path],
-                            capture_output=True,
-                        )
-                        if r.returncode == 0 and os.path.exists(small_path):
-                            new_size = os.path.getsize(small_path)
-                            if new_size <= MAX_FILE_SIZE:
-                                filepath = small_path
-                            else:
-                                continue
+    for fmt in [
+        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
+        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]/best",
+        "best[ext=mp4]/best",
+    ]:
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                opts = _base_opts(tmpdir, {
+                    "format": fmt,
+                    "outtmpl": os.path.join(tmpdir, "video.%(ext)s"),
+                    "noplaylist": True,
+                    "merge_output_format": "mp4",
+                })
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                filepath = _find_file(tmpdir, preferred_ext=".mp4")
+                size = os.path.getsize(filepath)
+                if size > MAX_FILE_SIZE:
+                    small_path = os.path.join(tmpdir, "small.mp4")
+                    r = subprocess.run(
+                        ["ffmpeg", "-y", "-i", filepath,
+                         "-vf", "scale=-2:480", "-c:v", "libx264",
+                         "-crf", "28", "-preset", "fast",
+                         "-c:a", "aac", "-b:a", "96k", small_path],
+                        capture_output=True,
+                    )
+                    if r.returncode == 0 and os.path.exists(small_path):
+                        new_size = os.path.getsize(small_path)
+                        if new_size <= MAX_FILE_SIZE:
+                            filepath = small_path
                         else:
                             continue
-                    title = (info or {}).get("title", title_fallback) if isinstance(info, dict) else title_fallback
-                    with open(filepath, "rb") as f:
-                        return f.read(), title or title_fallback
-            except Exception as e:
-                err = str(e).lower()
-                if is_yt and any(k in err for k in _YT_BOT_ERRORS):
-                    client_failed_with_auth = True
-                    break  # this client is blocked, try next client
-                continue
-        if client_failed_with_auth:
-            continue  # try next YouTube client
-
-    raise RuntimeError(f"Не удалось скачать видео: {url[:80]}")
-
-
-def _fetch_video_entries_yt(query: str, count: int = 20, max_dur: int = 720) -> list[dict]:
-    """Search YouTube for video entries — no API key required (yt_dlp ytsearch)."""
-    flat_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "noplaylist": True,
-        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
-    }
-    try:
-        with yt_dlp.YoutubeDL(flat_opts) as ydl:
-            meta = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
-        entries = meta.get("entries", []) if meta else []
-        result = []
-        for e in entries:
-            vid_id = e.get("id") or ""
-            if not vid_id:
-                continue
-            duration = e.get("duration") or 0
-            # Skip compilations and very long videos
-            if duration and duration > max_dur:
-                continue
-            title = e.get("title") or query
-            title_l = title.lower()
-            # Skip obvious compilations
-            if any(k in title_l for k in ("compilation", "сборник", "подборка", "топ ", "нон-стоп",
-                                           "hours", "часов", "нонстоп", "best of", "greatest")):
-                continue
-            url = (
-                e.get("url")
-                or e.get("webpage_url")
-                or f"https://www.youtube.com/watch?v={vid_id}"
-            )
-            result.append({
-                "id": f"yt_{vid_id}",
-                "url": url,
-                "title": title,
-                "duration": duration,
-                "platform": "YouTube",
-            })
-        return result
-    except Exception:
-        return []
-
-
-def _translate_query_to_en(query: str) -> str | None:
-    """
-    Simple transliteration/common-name lookup for popular search terms.
-    Returns an English version of a Russian-language query, or None.
-    """
-    _ru_to_en = {
-        "мистер бин": "Mr Bean",
-        "гарри поттер": "Harry Potter",
-        "властелин колец": "Lord of the Rings",
-        "звёздные войны": "Star Wars",
-        "звездные войны": "Star Wars",
-        "мстители": "Avengers",
-        "человек паук": "Spider-Man",
-        "бэтмен": "Batman",
-        "супермен": "Superman",
-        "терминатор": "Terminator",
-        "матрица": "The Matrix",
-        "интерстеллар": "Interstellar",
-        "форсаж": "Fast and Furious",
-        "шрек": "Shrek",
-        "симпсоны": "The Simpsons",
-        "том и джерри": "Tom and Jerry",
-        "спанч боб": "SpongeBob",
-        "губка боб": "SpongeBob",
-        "рик и морти": "Rick and Morty",
-        "ведьмак": "The Witcher",
-        "игра престолов": "Game of Thrones",
-        "сорвиголова": "Daredevil",
-        "джокер": "Joker",
-        "аватар": "Avatar",
-        "пираты карибского": "Pirates of the Caribbean",
-    }
-    q_lower = query.strip().lower()
-    for ru, en in _ru_to_en.items():
-        if ru in q_lower:
-            return q_lower.replace(ru, en)
-    return None
-
-
-def _collect_video_entries(query: str) -> list[dict]:
-    """
-    Gather video candidates from YouTube with multiple query variants.
-    Strategy:
-      1. Primary query — keep YouTube's relevance order (most relevant first).
-      2. Supplement with English variant / "+видео" if primary finds too few.
-      3. Fallback to 20-min limit only when primary finds nothing at all.
-    """
-    en_query = _translate_query_to_en(query)
-
-    def _fetch(q: str, max_dur: int) -> list[dict]:
-        return _fetch_video_entries_yt(q, count=20, max_dur=max_dur)
-
-    # ── Step 1: primary query (strict 12-min limit) ─────────────────────────
-    primary = _fetch(query, 720)
-
-    # ── Step 2: run supplementary searches in parallel ───────────────────────
-    supp_tasks: list[tuple[str, int]] = []
-    if en_query:
-        supp_tasks.append((en_query, 720))
-    # "+видео" helps when the plain query returns mostly music videos
-    supp_tasks.append((query + " видео", 720))
-    # Fallback with relaxed duration (20 min) when primary is dry
-    if len(primary) < 3:
-        supp_tasks.append((query, 1200))
-        if en_query:
-            supp_tasks.append((en_query, 1200))
-
-    supp: list[dict] = []
-    if supp_tasks:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(supp_tasks)) as pool:
-            fs = {pool.submit(_fetch, q, d): (q, d) for q, d in supp_tasks}
-            for future in concurrent.futures.as_completed(fs, timeout=22):
-                try:
-                    supp.extend(future.result())
-                except Exception:
-                    pass
-
-    # ── Merge: primary first (relevance-ordered), then supplements ───────────
-    seen_ids: set[str] = set()
-    all_entries: list[dict] = []
-
-    for e in primary:
-        eid = e.get("id") or e.get("url", "")[:40]
-        if eid not in seen_ids:
-            seen_ids.add(eid)
-            all_entries.append(e)
-
-    # Supplements: sort shorter-first so we try smaller files earlier
-    supp.sort(key=lambda e: (e.get("duration") or 9999))
-    for e in supp:
-        eid = e.get("id") or e.get("url", "")[:40]
-        if eid not in seen_ids:
-            seen_ids.add(eid)
-            all_entries.append(e)
-
-    return all_entries
-
-
-def _video_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("▶️ Следующий", callback_data="next_video"),
-    ]])
+                    else:
+                        continue
+                title = (info or {}).get("title", title_fallback) if isinstance(info, dict) else title_fallback
+                with open(filepath, "rb") as f:
+                    return f.read(), title or title_fallback
+        except Exception:
+            continue
+    raise RuntimeError(f"Не удалось скачать видео по ссылке: {url}")
 
 
 # ── Persistent state for video "Next" button ───────────────────────────────
-# Maps user_id → {"query": str, "entries": [...], "sent_ids": set}
+# Maps user_id → {"query": str, "platform": str, "entries": [...], "sent_ids": set}
 video_search_state: dict[int, dict] = {}
-
-# ── Persistent state for music "Ещё" button ────────────────────────────────
-# Maps user_id → {"query": str, "queries": [str,...], "idx": int}
-music_search_state: dict[int, dict] = {}
-
-def _music_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Ещё", callback_data="next_music"),
-    ]])
-
-
-def _is_artist_only(query: str) -> bool:
-    """Return True if query looks like just an artist name (no specific song title)."""
-    q = query.strip()
-    if any(sep in q for sep in (" - ", " – ", " — ")):
-        return False
-    song_hints = ("official", "lyrics", "audio", "video", "feat", "ft.", "remix",
-                  "acoustic", "live", "(", "cover", "original", "instrumental")
-    if any(k in q.lower() for k in song_hints):
-        return False
-    return len(q.split()) <= 4
-
-
-def _filter_music_entry(title: str, duration) -> bool:
-    """Return True if this track entry is a normal single track (not a compilation)."""
-    if not title:
-        return False
-    dur = duration or 0
-    if dur and (dur < 55 or dur > 620):
-        return False
-    skip_kw = (
-        "full album", "greatest hits", "compilation", "playlist", "best of",
-        "megamix", "medley", "non-stop", "nonstop", "1 hour", "2 hour", "10 hour",
-        "сборник", "все хиты", "подборка", "микс", "all songs", "full ost",
-    )
-    title_l = title.lower()
-    if any(k in title_l for k in skip_kw):
-        return False
-    return True
-
-
-def search_music_candidates(query: str) -> list[dict]:
-    """
-    Search SoundCloud + YouTube (+ Rutube) and collect candidate tracks.
-    Returns list of {url, title, source, duration} — does NOT download anything.
-    """
-    is_artist = _is_artist_only(query)
-
-    if is_artist:
-        # For artist-only: search directly by name (SoundCloud returns actual artist tracks)
-        sc_queries = [query, f"{query} official"]
-        yt_queries = [f"{query} official music video", f"{query} popular songs", f"{query} top hits"]
-        rt_queries = [f"{query} официальный", query]
-    else:
-        sc_queries = [query, f"{query} official audio"]
-        yt_queries = [query, f"{query} official audio", f"{query} audio"]
-        rt_queries = [query]
-
-    candidates: list[dict] = []
-    seen: set[str] = set()
-    artist_norm = re.sub(r'\W+', ' ', query.lower()).strip() if is_artist else ""
-
-    def _norm(t: str) -> str:
-        return re.sub(r'\W+', ' ', t.lower()).strip()
-
-    def _uploader_matches(entry: dict) -> bool:
-        """True if this track is by the queried artist (for artist-only searches)."""
-        if not is_artist:
-            return True
-        uploader = (entry.get("uploader") or entry.get("channel") or "").lower()
-        uploader_norm = re.sub(r'\W+', ' ', uploader).strip()
-        return artist_norm in uploader_norm or uploader_norm in artist_norm
-
-    def _add(entry: dict, source: str):
-        title = (entry.get("title") or "").strip()
-        url = entry.get("url") or entry.get("webpage_url") or ""
-        dur = entry.get("duration")
-        if not url or not title:
-            return
-        if not _filter_music_entry(title, dur):
-            return
-        key = _norm(title)
-        if key in seen:
-            return
-        seen.add(key)
-        priority = 0 if _uploader_matches(entry) else 1
-        candidates.append({"url": url, "title": title, "source": source,
-                            "duration": dur, "priority": priority})
-
-    # SoundCloud
-    for sq in sc_queries[:2]:
-        try:
-            opts = {"quiet": True, "no_warnings": True, "extract_flat": True}
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"scsearch10:{sq}", download=False)
-            for e in (info or {}).get("entries", []):
-                _add(e, "SoundCloud")
-        except Exception:
-            pass
-
-    # YouTube
-    yt_opts = {
-        "quiet": True, "no_warnings": True, "extract_flat": True,
-        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
-    }
-    for sq in yt_queries[:2]:
-        try:
-            with yt_dlp.YoutubeDL(yt_opts) as ydl:
-                info = ydl.extract_info(f"ytsearch10:{sq}", download=False)
-            for e in (info or {}).get("entries", []):
-                _add(e, "YouTube")
-        except Exception:
-            pass
-
-    # Rutube
-    for sq in rt_queries[:1]:
-        try:
-            for e in _search_rutube(sq, count=5):
-                _add(e, "Rutube")
-        except Exception:
-            pass
-
-    # Sort: priority 0 (by the artist) first, then others
-    candidates.sort(key=lambda c: c.get("priority", 1))
-    return candidates
-
-
-def download_music_from_candidate(candidate: dict) -> tuple[bytes, str, str]:
-    """Download a specific candidate track. Returns (audio_bytes, title, artist)."""
-    url = candidate["url"]
-    source = candidate.get("source", "")
-    title_hint = candidate.get("title", "")
-
-    if source == "YouTube":
-        for client in ["tv_embedded", "mweb"]:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                extra = {"extractor_args": {"youtube": {"player_client": [client]}}}
-                if _YT_COOKIE_FILE:
-                    extra["cookiefile"] = _YT_COOKIE_FILE
-                opts = {**_audio_opts(tmpdir), **extra}
-                try:
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                    return _read_audio_result(tmpdir, info, title_hint)
-                except Exception as e:
-                    err = str(e).lower()
-                    if any(k in err for k in _YT_BOT_ERRORS + ("not available", "drm")):
-                        continue
-                    raise
-        raise RuntimeError(f"YouTube: не удалось скачать трек «{title_hint}»")
-
-    # SoundCloud, Rutube, or generic
-    with tempfile.TemporaryDirectory() as tmpdir:
-        opts = _audio_opts(tmpdir)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-        return _read_audio_result(tmpdir, info, title_hint)
-
-
-def search_and_download_first_music(query: str) -> tuple[tuple[bytes, str, str], list[dict], int]:
-    """
-    Search candidates and download the first successful one.
-    Returns (result, all_candidates, used_index).
-    """
-    candidates = search_music_candidates(query)
-    if not candidates:
-        raise RuntimeError(
-            f"Не удалось найти «{query}».\n"
-            "Попробуй другой запрос или отправь прямую ссылку на трек."
-        )
-    last_err = None
-    for i, cand in enumerate(candidates):
-        try:
-            result = download_music_from_candidate(cand)
-            return result, candidates, i
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(
-        f"Не удалось скачать музыку по запросу «{query}».\n"
-        f"Последняя ошибка: {last_err}"
-    )
 
 
 def _next_unsent_entry(state: dict) -> dict | None:
@@ -1144,6 +902,10 @@ def _bing_images(query: str, max_results: int = 5, safe: bool = True) -> list[di
 def _ddg_images(query: str, max_results: int = 5, safe: bool = True) -> list[dict]:
     """DuckDuckGo image search fallback."""
     import time
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
     safesearch = "moderate" if safe else "off"
     ddgs = DDGS(timeout=10)
     raw = list(ddgs.images(query, safesearch=safesearch, max_results=max_results * 4))
@@ -1233,7 +995,159 @@ def extract_image_query(text: str) -> str:
     return text
 
 
-# ===== FONTS =====
+# ===== RADIO =====
+
+# Direct internet-radio stream URLs (live, no download needed — ffmpeg records N seconds)
+# Sources: SomaFM (free, reliable), RadioParadise, others
+_SF = "https://ice1.somafm.com/"   # SomaFM base (verified 200)
+_RP = "https://stream.radioparadise.com/"  # Radio Paradise base
+
+RADIO_STREAMS: dict[str, list[tuple[str, str]]] = {
+    # ── Verified working streams only ──────────────────────────────────────────
+    # Jazz/Soul/Funk — SomaFM Sonic Universe (jazzandblues = 404, sonicuniverse = 200)
+    "джаз":         [(_SF + "sonicuniverse-128-mp3",  "Sonic Universe Jazz · SomaFM")],
+    "jazz":         [(_SF + "sonicuniverse-128-mp3",  "Sonic Universe Jazz · SomaFM")],
+    "блюз":         [(_SF + "sonicuniverse-128-mp3",  "Sonic Universe Blues · SomaFM")],
+    "blues":        [(_SF + "sonicuniverse-128-mp3",  "Sonic Universe Blues · SomaFM")],
+    "соул":         [(_SF + "sonicuniverse-128-mp3",  "Sonic Universe Soul · SomaFM")],
+    "soul":         [(_SF + "sonicuniverse-128-mp3",  "Sonic Universe Soul · SomaFM")],
+    "фанк":         [(_SF + "sonicuniverse-128-mp3",  "Sonic Universe Funk · SomaFM")],
+    "funk":         [(_SF + "sonicuniverse-128-mp3",  "Sonic Universe Funk · SomaFM")],
+    # Metal
+    "металл":       [(_SF + "metal-128-mp3",          "Metal Detector · SomaFM")],
+    "metall":       [(_SF + "metal-128-mp3",          "Metal Detector · SomaFM")],
+    "metal":        [(_SF + "metal-128-mp3",          "Metal Detector · SomaFM")],
+    "хеви":         [(_SF + "metal-128-mp3",          "Metal Detector · SomaFM")],
+    # Indie / Alternative
+    "инди":         [(_SF + "indiepop-128-mp3",       "Indie Pop Rocks · SomaFM")],
+    "indie":        [(_SF + "indiepop-128-mp3",       "Indie Pop Rocks · SomaFM")],
+    "альтернатива": [(_SF + "indiepop-128-mp3",       "Indie Pop Rocks · SomaFM")],
+    # 80s
+    "80":           [(_SF + "u80s-128-mp3",           "Underground 80s · SomaFM")],
+    "80s":          [(_SF + "u80s-128-mp3",           "Underground 80s · SomaFM")],
+    "восьмидесятые":[(_SF + "u80s-128-mp3",           "Underground 80s · SomaFM")],
+    # Folk / Country
+    "фолк":         [(_SF + "folkfwd-128-mp3",        "Folk Forward · SomaFM")],
+    "folk":         [(_SF + "folkfwd-128-mp3",        "Folk Forward · SomaFM")],
+    "кантри":       [(_SF + "folkfwd-128-mp3",        "Folk Forward · SomaFM")],
+    "country":      [(_SF + "folkfwd-128-mp3",        "Folk Forward · SomaFM")],
+    # Lounge / Chill
+    "лаунж":        [(_SF + "lush-128-mp3",           "Lush Lounge · SomaFM")],
+    "lounge":       [(_SF + "lush-128-mp3",           "Lush Lounge · SomaFM")],
+    "чилл":         [(_SF + "lush-128-mp3",           "Lush Lounge · SomaFM"),
+                     (_SF + "groovesalad-128-mp3",    "Groove Salad · SomaFM")],
+    "chill":        [(_SF + "lush-128-mp3",           "Lush Lounge · SomaFM")],
+    "романтика":    [(_SF + "lush-128-mp3",           "Lush Lounge · SomaFM")],
+    # Ambient / Relax / Sleep
+    "амбиент":      [(_SF + "deepspaceone-128-mp3",   "Deep Space One · SomaFM"),
+                     (_SF + "groovesalad-128-mp3",    "Groove Salad · SomaFM")],
+    "ambient":      [(_SF + "deepspaceone-128-mp3",   "Deep Space One · SomaFM")],
+    "релакс":       [(_SF + "deepspaceone-128-mp3",   "Deep Space One · SomaFM")],
+    "relax":        [(_SF + "deepspaceone-128-mp3",   "Deep Space One · SomaFM")],
+    "медитация":    [(_SF + "deepspaceone-128-mp3",   "Deep Space One · SomaFM")],
+    "meditation":   [(_SF + "deepspaceone-128-mp3",   "Deep Space One · SomaFM")],
+    "для сна":      [(_SF + "deepspaceone-128-mp3",   "Deep Space One · SomaFM")],
+    "sleep":        [(_SF + "deepspaceone-128-mp3",   "Deep Space One · SomaFM")],
+    "фоновая":      [(_SF + "groovesalad-128-mp3",    "Groove Salad · SomaFM")],
+    "фон":          [(_SF + "groovesalad-128-mp3",    "Groove Salad · SomaFM")],
+    # Electronic / Dance
+    "электронная":  [(_SF + "groovesalad-128-mp3",    "Groove Salad · SomaFM"),
+                     (_SF + "beatblender-128-mp3",    "Beat Blender · SomaFM")],
+    "электро":      [(_SF + "beatblender-128-mp3",    "Beat Blender · SomaFM")],
+    "electronic":   [(_SF + "groovesalad-128-mp3",    "Groove Salad · SomaFM")],
+    "house":        [(_SF + "beatblender-128-mp3",    "Beat Blender · SomaFM")],
+    "хаус":         [(_SF + "beatblender-128-mp3",    "Beat Blender · SomaFM")],
+    "edm":          [(_SF + "beatblender-128-mp3",    "Beat Blender · SomaFM")],
+    # Lofi
+    "лофи":         [(_SF + "groovesalad-128-mp3",    "Groove Salad · SomaFM")],
+    "lofi":         [(_SF + "groovesalad-128-mp3",    "Groove Salad · SomaFM")],
+    # Rock — RadioParadise Rock (verified 200)
+    "рок":          [(_RP + "rock-128",               "Rock · Radio Paradise")],
+    "rock":         [(_RP + "rock-128",               "Rock · Radio Paradise")],
+    "хардрок":      [(_RP + "rock-128",               "Rock · Radio Paradise")],
+    "hard rock":    [(_RP + "rock-128",               "Rock · Radio Paradise")],
+    # Pop / General — RadioParadise main (verified 200)
+    "поп":          [(_RP + "mp3-128",                "Radio Paradise")],
+    "pop":          [(_RP + "mp3-128",                "Radio Paradise")],
+    "топ":          [(_RP + "mp3-128",                "Radio Paradise")],
+    # Reggae
+    "регги":        [(_SF + "reggae-128-mp3",         "Reggae · SomaFM")],
+    "reggae":       [(_SF + "reggae-128-mp3",         "Reggae · SomaFM")],
+    # Phonk / Trap / Rap / Hip-hop — no live stream → YouTube only (no entry here)
+}
+
+
+def _ffmpeg_record_stream(stream_url: str, out_path: str, duration_sec: int, timeout: int) -> None:
+    """Record a radio stream (or any URL) for duration_sec seconds using ffmpeg subprocess."""
+    import subprocess
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", stream_url,
+        "-t", str(duration_sec),
+        "-c:a", "libmp3lame", "-b:a", "128k",
+        "-f", "mp3",
+        out_path,
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise TimeoutError(f"ffmpeg timed out after {timeout}s")
+    if proc.returncode not in (0, 255):  # 255 = EOF on stream (normal)
+        raise RuntimeError(f"ffmpeg exited with code {proc.returncode}")
+
+
+def extract_radio_genre(text: str) -> str:
+    """Strip trigger words and return the genre keyword."""
+    cleaned = re.sub(
+        r'\b(радио|radio|включи|поставь|запусти|найди|дай|хочу|слушать|послушать|'
+        r'музыку|музыка|стиль|в\s+стиле|со?\s+стилем)\b',
+        ' ', text, flags=re.IGNORECASE,
+    )
+    return cleaned.strip(" ,-–—.!?").lower()
+
+
+def match_radio_genre(raw: str) -> tuple[str, list[str], list[tuple[str, str]]]:
+    """Return (matched_key, yt_queries, stream_urls). Falls back to YouTube-only."""
+    raw = raw.strip().lower()
+    streams = RADIO_STREAMS.get(raw, [])
+    yt_q = RADIO_QUERIES.get(raw, [])
+    if streams or yt_q:
+        return raw, yt_q, streams
+    for key in RADIO_QUERIES:
+        if key in raw or (len(raw) > 2 and raw in key):
+            return key, RADIO_QUERIES[key], RADIO_STREAMS.get(key, [])
+    fallback_q = f"{raw} music radio mix" if raw else "music radio mix"
+    return raw, [fallback_q, f"{raw} radio"], []
+
+
+def download_radio_audio(
+    yt_queries: list[str],
+    streams: list[tuple[str, str]],
+    genre_label: str,
+    target_sec: int = 1500,
+) -> tuple[bytes, str]:
+    """
+    Try live radio streams (ffmpeg records N seconds).
+    Returns (mp3_bytes, title).
+    """
+    import subprocess
+
+    for stream_url, stream_title in streams:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = os.path.join(tmpdir, "radio.mp3")
+            try:
+                _ffmpeg_record_stream(stream_url, out, target_sec, timeout=target_sec + 30)
+                if os.path.exists(out) and os.path.getsize(out) > 100_000:
+                    with open(out, "rb") as f:
+                        return f.read(), stream_title
+            except Exception:
+                continue
+
+    raise RuntimeError(f"Не удалось найти поток для радио «{genre_label}»")
+
 
 def _github_font_listing(slug: str) -> list | None:
     """Return list of file dicts from google/fonts GitHub repo for the given slug."""
@@ -1694,6 +1608,10 @@ def download_all_fonts(font_name: str) -> tuple[str, bytes]:
 # ===== PHOTO UPSCALE x3 =====
 
 UPSCALE_RE = re.compile(r'улучши\s*фото', re.IGNORECASE)
+FIND_IMG_RE = re.compile(
+    r'\b(найди|найти|поиск|откуда|источник|оригинал|найди\s*оригинал|найди\s*фото|найди\s*картинку)\b',
+    re.IGNORECASE
+)
 
 _MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".models")
 _ESPCN_PATH = os.path.join(_MODEL_DIR, "ESPCN_x3.pb")
@@ -1848,26 +1766,6 @@ def compress_image_to_size(image_bytes: bytes, target_bytes: int) -> bytes:
     return best
 
 
-def compress_zip_images(zip_bytes: bytes, target_bytes: int):
-    """Compress images in a zip that exceed target_bytes. Returns (new_zip_bytes, total_images, compressed_count)."""
-    _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    in_zip = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
-    out_buf = io.BytesIO()
-    total = 0
-    compressed_count = 0
-    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_STORED) as out_zip:
-        for name in in_zip.namelist():
-            data = in_zip.read(name)
-            ext = os.path.splitext(name)[1].lower()
-            if ext in _IMAGE_EXTS:
-                total += 1
-                if len(data) > target_bytes:
-                    data = compress_image_to_size(data, target_bytes)
-                    compressed_count += 1
-            out_zip.writestr(name, data)
-    return out_buf.getvalue(), total, compressed_count
-
-
 # Buffer for album (media group) photos
 _album_buffer: dict = {}
 
@@ -1975,8 +1873,8 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 size_mb = len(result_bytes) / (1024 * 1024)
                 filename = "upscaled_3x.jpg"
                 fmt = "JPEG"
-            await _safe_send_doc(
-                message, result_bytes,
+            await message.reply_document(
+                document=io.BytesIO(result_bytes),
                 filename=filename,
                 caption=(
                     f"✅ Готово! Увеличено в 3x ({fmt})\n"
@@ -1996,7 +1894,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dl = io.BytesIO()
             await file.download_to_memory(dl)
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(_EXECUTOR, analyze_text_percentage, dl.getvalue())
+            result = await loop.run_in_executor(None, analyze_text_percentage, dl.getvalue())
             await message.reply_text(f"📊 {result}")
             await msg.delete()
         except Exception as e:
@@ -2051,8 +1949,8 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📷 Фото получено!\n\n"
             "Что я умею с фото:\n"
             "• Подпиши «улучши фото» — увеличу в 3x\n"
-            "• Подпиши «процент текста» — определю долю текста\n"
-            "• Для сжатия — отправь ZIP-архив с картинками и подпиши «до 512кб»"
+            "• Подпиши «до 500кб» (любой размер) — сожму\n"
+            "• Подпиши «процент текста» — определю долю текста"
         )
 
 
@@ -2079,10 +1977,6 @@ def _base_opts(tmpdir, extra=None):
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 10,
-        "retries": 1,
-        "fragment_retries": 1,
-        "extractor_retries": 1,
     }
     if extra:
         opts.update(extra)
@@ -2203,63 +2097,23 @@ def _sc_search_best(query: str, tmpdir: str, count: int = 5):
     return info
 
 
-def _yt_extractor_args():
-    """Return yt-dlp opts that bypass YouTube bot-detection. Uses cookies if available."""
-    opts = {"extractor_args": {"youtube": {"player_client": ["tv_embedded"]}}}
-    if _YT_COOKIE_FILE:
-        opts["cookiefile"] = _YT_COOKIE_FILE
-    return opts
+def download_music(query: str):
+    """Search and download audio from multiple sources: SoundCloud (smart pick) → SoundCloud (1st) → Rutube."""
+    last_err = None
 
-
-def _try_youtube_music(query: str):
-    """Try YouTube audio download, returns (bytes, title, artist) or raises."""
-    flat_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        **_yt_extractor_args(),
-    }
-    with yt_dlp.YoutubeDL(flat_opts) as ydl:
-        flat_info = ydl.extract_info(f"ytsearch5:{query}", download=False)
-    entries = [e for e in (flat_info or {}).get("entries", []) if e]
-    if not entries:
-        raise RuntimeError("Нет результатов на YouTube")
-    scored = sorted(entries, key=lambda e: _best_match_score(e.get("title", ""), query), reverse=True)
-    best = scored[0]
-    url = best.get("url") or best.get("webpage_url", "")
-    if not url:
-        raise RuntimeError("Нет URL у лучшего результата")
-    yt_audio_clients = ["tv_embedded", "mweb", "ios"]
-    for client in yt_audio_clients:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            extra_args = {"extractor_args": {"youtube": {"player_client": [client]}}}
-            if _YT_COOKIE_FILE:
-                extra_args["cookiefile"] = _YT_COOKIE_FILE
-            opts = {**_audio_opts(tmpdir), **extra_args}
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                return _read_audio_result(tmpdir, info, query)
-            except Exception as e:
-                err = str(e).lower()
-                if any(k in err for k in _YT_BOT_ERRORS + ("not available", "drm")):
-                    continue
-                raise
-    raise RuntimeError(f"YouTube: не удалось скачать аудио по запросу «{query}»")
-
-
-def _try_soundcloud(query: str):
-    """Try SoundCloud download, returns (bytes, title, artist) or raises."""
+    # 1. SoundCloud — fetch 5 results, pick best match by title similarity
     with tempfile.TemporaryDirectory() as tmpdir:
-        info = _sc_search_best(query, tmpdir, count=5)
-        return _read_audio_result(tmpdir, info, query)
+        try:
+            info = _sc_search_best(query, tmpdir, count=5)
+            return _read_audio_result(tmpdir, info, query)
+        except Exception as e:
+            last_err = e
 
-
-def _try_rutube(query: str):
-    """Try Rutube download, returns (bytes, title, artist) or raises."""
+    # 2. Rutube music search — good coverage of Russian tracks
     for q in [query, f"{query} official audio", f"{query} аудио"]:
         entries = _search_rutube(q, count=5)
         for e in entries:
+            # Only try entries that look like audio/music (duration < 15 min)
             dur = e.get("duration") or 0
             if dur and dur > 900:
                 continue
@@ -2269,37 +2123,13 @@ def _try_rutube(query: str):
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         info = ydl.extract_info(e["url"], download=True)
                     return _read_audio_result(tmpdir, info, query)
-                except Exception:
+                except Exception as ex:
+                    last_err = ex
                     continue
-    raise RuntimeError(f"Rutube: ничего не нашёл по «{query}»")
-
-
-def download_music(query: str):
-    """
-    Concurrently search SoundCloud + Rutube + YouTube, return the first success.
-    Falls back to the slower sources if the first attempt fails.
-    """
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        fs = {
-            pool.submit(_try_soundcloud, query): "SoundCloud",
-            pool.submit(_try_rutube, query): "Rutube",
-            pool.submit(_try_youtube_music, query): "YouTube",
-        }
-        errors = []
-        for future in concurrent.futures.as_completed(fs, timeout=90):
-            try:
-                result = future.result()
-                # Cancel the other task
-                for f in fs:
-                    f.cancel()
-                return result
-            except Exception as e:
-                errors.append(str(e))
-                continue
 
     raise RuntimeError(
         f"Не удалось найти «{query}».\n"
-        "Попробуй другой запрос или отправь прямую ссылку на трек."
+        f"Попробуй другой запрос или отправь прямую ссылку на трек."
     )
 
 
@@ -2315,8 +2145,9 @@ def download_audio_url(url: str):
             raise RuntimeError(str(e)[:400]) from e
 
 
+
+
 async def music_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
     query = " ".join(context.args).strip()
     if not query:
         await update.message.reply_text(
@@ -2325,24 +2156,21 @@ async def music_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    msg = await update.message.reply_text(f"🔍 Ищу: {query}…")
-    loop = asyncio.get_running_loop()
+    msg = await update.message.reply_text(f"🔍 Ищу: {query}...")
+
     try:
-        result, candidates, used_idx = await asyncio.wait_for(
-            loop.run_in_executor(_EXECUTOR, search_and_download_first_music, query),
-            timeout=150,
+        loop = asyncio.get_running_loop()
+        audio_bytes, title, artist = await loop.run_in_executor(
+            None, download_music, query
         )
-        audio_bytes, title, artist = result
-        music_search_state[user_id] = {"candidates": candidates, "idx": used_idx, "query": query}
-        await msg.edit_text("📤 Загружаю файл…")
-        await _safe_send_audio(
-            update.message, audio_bytes,
-            filename=f"{title}.mp3", title=title, performer=artist,
-            reply_markup=_music_keyboard(),
+        await msg.edit_text("📤 Загружаю файл...")
+        await update.message.reply_audio(
+            audio=io.BytesIO(audio_bytes),
+            filename=f"{title}.mp3",
+            title=title,
+            performer=artist,
         )
         await msg.delete()
-    except asyncio.TimeoutError:
-        await msg.edit_text("⏱ Превышено время ожидания. Попробуй ещё раз.")
     except Exception as e:
         await msg.edit_text(f"⚠ Ошибка: {e}")
 
@@ -2352,47 +2180,34 @@ async def music_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     await update.message.reply_text(
-        "🤖 *Бот* — пиши что угодно.\n"
+        "🤖 *AI Бот* — пиши что угодно, отвечаю как живой человек.\n"
         "\n"
-        "💬 *Общение*\n"
-        "• Любой вопрос — отвечу развёрнуто\n"
-        "• Поддерживаю контекст разговора\n"
-        "• /reset — очистить память\n"
         "\n"
-        "🎬 *Видео*\n"
-        "• *«видео котики»* — скачаю с YouTube / Rutube / Dailymotion / Vimeo\n"
-        "• *«трейлер Интерстеллар»* — найду и пришлю файлом\n"
-        "• Ссылка VK (vk.com/video...) — скачаю видео\n"
-        "• Кнопка *▶️ Следующий* — попробую другой вариант\n"
+        "💬 *Общение и поиск в интернете*\n"
+        "• *Любой вопрос* — отвечу развёрнуто\n"
+        "• *«Что такое квантовая механика?»* — найду актуальную информацию с картинками\n"
+        "• *«Какие сеансы в кинотеатре Россия в Саранске?»* — найду расписание онлайн\n"
+        "• *«Какой курс доллара?»* или *«последние новости»* — актуальные данные из сети\n"
         "\n"
-        "🎵 *Музыка*\n"
+        "\n"
+        "🎵 *Музыка и аудио*\n"
+        "• *«Пришли музыку из фильма Интерстеллар»* — найду и скачаю саундтрек\n"
         "• *«музыка Imagine Dragons Believer»* — скачаю трек\n"
-        "• *«Пришли музыку из фильма Интерстеллар»* — найду саундтрек\n"
-        "• Ссылка SoundCloud / VK аудио / Deezer — скачаю MP3\n"
-        "• Кнопка *🔄 Ещё* — попробую другой вариант трека\n"
+        "• Ссылка *VK / SoundCloud / Deezer* — скачаю аудио\n"
         "\n"
-        "🖼 *Фото*\n"
-        "• Фото + *«улучши фото»* — увеличу в 3× в высоком качестве\n"
-        "• Фото + *«процент текста»* — покажу долю текста на изображении\n"
-        "• Фото + *«до 200кб»* — сожму до нужного размера\n"
-        "• *«покажи закат»* / *«фото машины»* — найду и пришлю фото из сети\n"
         "\n"
-        "📦 *Архивы ZIP*\n"
-        "• ZIP с картинками — переименую файлы по размеру (напр. 1920x1080.jpg)\n"
-        "• ZIP + *«до 512кб»* — сожму картинки, превышающие указанный размер\n"
-        "• ZIP + *«собери гиф»* — соберу GIF из групп картинок\n"
+        "🖼 *Работа с фото*\n"
+        "• Фото-файл + подпись *«найди»* или *«оригинал»* — найду оригинал в интернете (до 50МБ)\n"
+        "• Фото + подпись *«улучши фото»* — увеличу в 3x в высоком качестве\n"
+        "• Фото + подпись *«до 500кб»* — сожму до нужного размера\n"
+        "• Несколько фото + *«до 300кб»* — сожму каждое и упакую в архив\n"
+        "• Фото + подпись *«процент текста»* — покажу сколько % занимает текст\n"
+        "• Архив *.zip* с картинками — переименую файлы по размеру (напр. 1920x1080.jpg)\n"
+        "• Архив *.zip* + подпись *«собери гиф»* — соберу GIF из групп картинок\n"
         "\n"
-        "📸 *Instagram*\n"
-        "• Ссылка instagram.com/username — соберу всех подписчиков и пришлю .txt файлом\n"
-        "\n"
-        "⚙ *Патч EXE (без прав администратора)*\n"
-        "• Файл .exe (до 20 МБ) — уберу требование прав администратора и пришлю обратно\n"
-        "• Файл .exe (больше 20 МБ) — загрузи на litterbox.catbox.moe или filebin.net, пришли ссылку — патчу и пришлю новую\n"
-        "• Файл > 50 МБ после патча — автоматически загружу на файлохостинг\n"
         "\n"
         "🔤 *Шрифты*\n"
-        "• *«шрифт Roboto»* — найду и пришлю TTF с выбором начертания\n"
-        "• /font Roboto — то же самое через команду",
+        "• *«шрифт Roboto»* — найду и пришлю бесплатный TTF-файл с выбором начертания",
         parse_mode="Markdown",
         reply_markup=main_keyboard()
     )
@@ -2469,90 +2284,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_memory[user_id] = []
         await query.message.reply_text("🗑 Память очищена")
 
-    elif query.data == "next_video":
-        state = video_search_state.get(user_id)
-        if not state:
-            await query.message.reply_text("⚠ Нет активного поиска видео.")
-            return
-        status = await query.message.reply_text("🔄 Ищу следующий вариант…")
-        await _send_next_video(
-            query.message.reply_video,
-            query.message.reply_document,
-            query.message.reply_text,
-            user_id, status,
-        )
-
-    elif query.data == "next_music":
-        state = music_search_state.get(user_id)
-        if not state:
-            await query.message.reply_text("⚠ Нет активного поиска музыки. Отправь новый запрос.")
-            return
-        candidates = state.get("candidates", [])
-        idx = state.get("idx", 0) + 1
-        original_query = state.get("query", "")
-        loop = asyncio.get_running_loop()
-
-        # Find next downloadable candidate
-        status = await query.message.reply_text("🔄 Ищу другой трек…")
-        sent = False
-        while idx < len(candidates):
-            cand = candidates[idx]
-            state["idx"] = idx
-            try:
-                await status.edit_text(f"⬇️ Скачиваю: «{cand['title'][:50]}»…")
-                audio_bytes, title, artist = await asyncio.wait_for(
-                    loop.run_in_executor(_EXECUTOR, download_music_from_candidate, cand),
-                    timeout=120,
-                )
-                await status.edit_text("📤 Загружаю…")
-                await _safe_send_audio(
-                    query.message, audio_bytes,
-                    filename=f"{title}.mp3", title=title, performer=artist,
-                    reply_markup=_music_keyboard(),
-                )
-                await status.delete()
-                sent = True
-                break
-            except asyncio.TimeoutError:
-                idx += 1
-                continue
-            except Exception:
-                idx += 1
-                continue
-
-        if not sent:
-            # All candidates exhausted — try fetching more with a fresh search
-            try:
-                await status.edit_text("🔍 Ищу ещё треки…")
-                extra = await loop.run_in_executor(
-                    _EXECUTOR, search_music_candidates,
-                    original_query + " alternative" if original_query else original_query
-                )
-                # Filter already-seen
-                seen_urls = {c["url"] for c in candidates}
-                new_cands = [c for c in extra if c["url"] not in seen_urls]
-                if new_cands:
-                    state["candidates"] = candidates + new_cands
-                    cand = new_cands[0]
-                    state["idx"] = len(candidates)
-                    await status.edit_text(f"⬇️ Скачиваю: «{cand['title'][:50]}»…")
-                    audio_bytes, title, artist = await asyncio.wait_for(
-                        loop.run_in_executor(_EXECUTOR, download_music_from_candidate, cand),
-                        timeout=120,
-                    )
-                    await status.edit_text("📤 Загружаю…")
-                    await _safe_send_audio(
-                        query.message, audio_bytes,
-                        filename=f"{title}.mp3", title=title, performer=artist,
-                        reply_markup=_music_keyboard(),
-                    )
-                    await status.delete()
-                else:
-                    await status.edit_text("😔 Больше вариантов нет. Попробуй другой запрос.")
-                    music_search_state.pop(user_id, None)
-            except Exception as e:
-                await status.edit_text(f"😔 Больше вариантов нет. Попробуй другой запрос.")
-
     elif query.data.startswith("fs:"):
         style = query.data[3:]
         font_name = font_pending.pop(user_id, None)
@@ -2594,337 +2325,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.delete()
             except Exception as e:
                 await msg.edit_text(f"⚠ {e}")
-
-
-# ===== VIDEO SEARCH HANDLER =====
-
-async def _handle_video_search(update: Update, query: str):
-    """Search multiple platforms and send the first downloadable video."""
-    user_id = update.message.from_user.id
-    loop = asyncio.get_running_loop()
-
-    status = await update.message.reply_text(
-        f"🎬 Ищу видео: «{query[:60]}»…\n🔍 YouTube"
-    )
-
-    try:
-        entries = await asyncio.wait_for(
-            loop.run_in_executor(_EXECUTOR, _collect_video_entries, query),
-            timeout=35,
-        )
-    except asyncio.TimeoutError:
-        await status.edit_text("⏱ Поиск завис, попробуй ещё раз.")
-        return
-
-    if not entries:
-        await status.edit_text(f"😔 Ничего не нашёл по запросу «{query}».")
-        with _memory_lock:
-            history = user_memory.get(user_id, [])
-            history.append({"role": "user", "content": f"найди видео {query}"})
-            history.append({"role": "assistant", "content": f"Поискал видео «{query}» на YouTube, Dailymotion, Rutube и Vimeo — вообще ничего не нашёл. Попробуй переформулировать запрос или уточни что именно хочешь посмотреть."})
-            user_memory[user_id] = history[-10:]
-        return
-
-    # Save state for "Next" button
-    video_search_state[user_id] = {
-        "query": query,
-        "entries": entries,
-        "sent_ids": set(),
-    }
-
-    await _send_next_video(update.message.reply_video,
-                           update.message.reply_document,
-                           update.message.reply_text,
-                           user_id, status)
-
-
-async def _send_next_video(reply_video_fn, reply_doc_fn, reply_text_fn, user_id: int, status_msg):
-    """Try platforms one by one until a video is sent or all options exhausted."""
-    state = video_search_state.get(user_id)
-    if not state:
-        await status_msg.edit_text("⚠ Нет активного поиска.")
-        return
-
-    loop = asyncio.get_running_loop()
-    tried_platforms: set[str] = set()
-    yt_blocked = False  # skip all YouTube entries if auth error detected
-
-    while True:
-        entry = _next_unsent_entry(state)
-        if entry is None:
-            # All entries exhausted — send YouTube link with natural AI explanation
-            query_text = state.get("query", "видео")
-            video_search_state.pop(user_id, None)
-            yt_link = f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(query_text)}"
-            system_extra = (
-                f"ВАЖНО: Ты пытался найти и прислать видео «{query_text}», "
-                f"перебрал YouTube, Dailymotion, Rutube и Vimeo, но все ролики оказались "
-                f"слишком большими или недоступными для загрузки в Telegram. "
-                f"Скажи об этом честно и коротко, предложи открыть поиск по ссылке: {yt_link} "
-                f"(вставь ссылку прямо в ответ). Говори в своём обычном стиле."
-            )
-            try:
-                ai_text = await loop.run_in_executor(
-                    None, ask_groq, user_id, f"видео {query_text}", system_extra
-                )
-                await reply_text_fn(ai_text)
-            except Exception:
-                await reply_text_fn(
-                    f"Блять, все ролики по «{query_text}» оказались либо слишком большими, "
-                    f"либо вообще не качаются. Сам посмотри тут: {yt_link}"
-                )
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-            return
-
-        state["sent_ids"].add(entry["id"])
-        platform = entry.get("platform", "")
-        title = entry.get("title", "")
-        dur = entry.get("duration") or 0
-        dur_str = f"{int(dur)//60}:{int(dur)%60:02d}" if dur else "?"
-
-        # Skip YouTube entries quickly if it was already blocked by auth
-        if yt_blocked and platform == "YouTube":
-            print(f"[video] skipping YouTube (auth blocked): {title[:60]}", flush=True)
-            continue
-
-        # Show which platform we're trying now
-        if platform not in tried_platforms:
-            tried_platforms.add(platform)
-            try:
-                await status_msg.edit_text(
-                    f"🔍 Пробую {platform}…\n🎬 {title[:60]}"
-                )
-            except Exception:
-                pass
-        else:
-            try:
-                await status_msg.edit_text(
-                    f"⬇️ Скачиваю с {platform}…\n🎬 {title[:60]}"
-                )
-            except Exception:
-                pass
-
-        try:
-            vid_bytes, vid_title = await asyncio.wait_for(
-                loop.run_in_executor(_EXECUTOR, _download_video_url, entry["url"], title),
-                timeout=60,
-            )
-        except asyncio.TimeoutError:
-            print(f"[video] timeout: {entry['url'][:80]}", flush=True)
-            continue
-        except Exception as _ve:
-            err_str = str(_ve).lower()
-            if platform == "YouTube" and any(k in err_str for k in _YT_BOT_ERRORS):
-                yt_blocked = True
-                print(f"[video] YouTube auth blocked, skipping remaining YT entries", flush=True)
-            else:
-                print(f"[video] fail ({platform}): {str(_ve)[:120]}", flush=True)
-            continue
-
-        # Success — send the video
-        size_mb = len(vid_bytes) / (1024 * 1024)
-        caption = (
-            f"🎬 {vid_title or title}\n"
-            f"⏱ {dur_str}  💾 {size_mb:.1f} МБ  📺 {platform}"
-        )
-        safe_name = re.sub(r'[^\w\s-]', '', title)[:40].strip().replace(' ', '_') or "video"
-
-        try:
-            await status_msg.edit_text("📤 Отправляю…")
-            await reply_video_fn(
-                video=io.BytesIO(vid_bytes),
-                filename=f"{safe_name}.mp4",
-                caption=caption,
-                reply_markup=_video_keyboard(),
-                supports_streaming=True,
-            )
-        except Exception:
-            try:
-                await reply_doc_fn(
-                    document=io.BytesIO(vid_bytes),
-                    filename=f"{safe_name}.mp4",
-                    caption=caption,
-                    reply_markup=_video_keyboard(),
-                )
-            except Exception as e:
-                # File too large for Telegram — try next entry
-                print(f"[video] telegram send failed ({platform}): {str(e)[:120]}", flush=True)
-                try:
-                    await status_msg.edit_text(
-                        f"⚠ Файл слишком большой ({size_mb:.0f} МБ), ищу другой вариант…"
-                    )
-                except Exception:
-                    pass
-                continue
-
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-        return
-
-
-# ===== INSTAGRAM FOLLOWERS SCRAPER =====
-
-# Slugs that are not real user pages (Instagram service paths)
-_IG_RESERVED = {
-    "p", "reel", "stories", "explore", "tv", "reels",
-    "accounts", "about", "privacy", "legal", "help",
-    "ar", "en", "ru", "de", "fr", "es", "it", "pt",
-    "direct", "oauth", "api", "web", "graphql",
-}
-
-
-def scrape_instagram_followers(
-    target_username: str,
-    progress_cb=None,
-) -> tuple[list[str], str, int]:
-    """
-    Login to Instagram, scrape all followers of `target_username`.
-    Returns (follower_usernames, display_name, total_count).
-    `progress_cb(done: int)` is called every 50 fetched followers.
-    Requires INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD env vars.
-    """
-    ig_user = os.environ.get("INSTAGRAM_USERNAME", "")
-    ig_pass = os.environ.get("INSTAGRAM_PASSWORD", "")
-
-    if not ig_user or not ig_pass:
-        raise RuntimeError(
-            "INSTAGRAM_CREDENTIALS_MISSING"
-        )
-
-    L = instaloader.Instaloader(
-        quiet=True,
-        sleep=True,
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-        compress_json=False,
-    )
-
-    ig_session_id = os.environ.get("INSTAGRAM_SESSION_ID", "")
-
-    if ig_session_id:
-        try:
-            import http.cookiejar
-            L.context._session.cookies.set(
-                "sessionid", ig_session_id, domain=".instagram.com"
-            )
-            L.context.username = ig_user
-        except Exception as e:
-            raise RuntimeError(f"INSTAGRAM_SESSION_ERROR: {e}")
-    else:
-        try:
-            L.login(ig_user, ig_pass)
-        except instaloader.exceptions.BadCredentialsException:
-            raise RuntimeError("INSTAGRAM_BAD_CREDENTIALS")
-        except instaloader.exceptions.TwoFactorAuthRequiredException:
-            raise RuntimeError("INSTAGRAM_2FA_REQUIRED")
-        except Exception as e:
-            raise RuntimeError(f"INSTAGRAM_LOGIN_ERROR: {e}")
-
-    try:
-        profile = instaloader.Profile.from_username(L.context, target_username)
-    except instaloader.exceptions.ProfileNotExistsException:
-        raise RuntimeError(f"Профиль @{target_username} не существует.")
-    except Exception as e:
-        raise RuntimeError(f"Не удалось открыть профиль: {e}")
-
-    display_name = profile.full_name or target_username
-    total_count = profile.followers
-
-    usernames: list[str] = []
-    try:
-        for follower in profile.get_followers():
-            usernames.append(follower.username)
-            if progress_cb and len(usernames) % 50 == 0:
-                progress_cb(len(usernames))
-    except instaloader.exceptions.LoginRequiredException:
-        if not usernames:
-            raise RuntimeError(
-                "Instagram требует вход для просмотра подписчиков этого аккаунта.\n"
-                "Проверь настройки аккаунта — возможно, он закрытый."
-            )
-
-    return usernames, display_name, total_count
-
-
-# ===== AUTO-UPLOAD HELPERS =====
-
-_TG_SEND_LIMIT = 50 * 1024 * 1024  # 50 MB — Telegram bot send limit
-
-
-async def _safe_send_audio(
-    message,
-    data: bytes,
-    filename: str,
-    title: str = "",
-    performer: str = "",
-    caption: str = "",
-    reply_markup=None,
-) -> None:
-    """Send audio; auto-upload to filehost if file exceeds Telegram's 50 MB limit."""
-    if len(data) <= _TG_SEND_LIMIT:
-        try:
-            kwargs = dict(
-                audio=io.BytesIO(data),
-                filename=filename,
-                title=title or filename,
-                performer=performer,
-                caption=caption or None,
-            )
-            if reply_markup is not None:
-                kwargs["reply_markup"] = reply_markup
-            await message.reply_audio(**kwargs)
-            return
-        except Exception:
-            pass  # fall through to filehost upload
-
-    # Upload to filehost (litterbox / filebin)
-    loop = asyncio.get_running_loop()
-    link = await loop.run_in_executor(None, upload_to_filehost, data, filename)
-    size_mb = len(data) / (1024 * 1024)
-    text = f"📦 Файл слишком большой для Telegram ({size_mb:.0f} МБ) — загружен на хостинг:\n{link}"
-    if title:
-        text = f"🎵 {title}\n" + text
-    await message.reply_text(text)
-
-
-async def _safe_send_doc(
-    message,
-    data: bytes,
-    filename: str,
-    caption: str = "",
-    reply_markup=None,
-) -> None:
-    """Send document; auto-upload to filehost if file exceeds Telegram's 50 MB limit."""
-    if len(data) <= _TG_SEND_LIMIT:
-        try:
-            kwargs = dict(
-                document=io.BytesIO(data),
-                filename=filename,
-                caption=caption or None,
-            )
-            if reply_markup is not None:
-                kwargs["reply_markup"] = reply_markup
-            await message.reply_document(**kwargs)
-            return
-        except Exception:
-            pass  # fall through to catbox upload
-
-    loop = asyncio.get_running_loop()
-    link = await loop.run_in_executor(None, upload_to_filehost, data, filename)
-    size_mb = len(data) / (1024 * 1024)
-    text = f"📦 Файл слишком большой для Telegram ({size_mb:.0f} МБ) — загружен на хостинг:\n{link}"
-    if caption:
-        text = caption + "\n" + text
-    await message.reply_text(text)
 
 
 # ===== CHAT =====
@@ -2982,10 +2382,10 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
                 names_list = "\n".join(f"• {n}" for n in created)
-                await _safe_send_doc(
-                    update.message, result_zip,
+                await update.message.reply_document(
+                    document=io.BytesIO(result_zip),
                     filename="gifs.zip",
-                    caption=f"✅ Готово! Создано GIF-файлов: {len(created)}\n{names_list}",
+                    caption=f"✅ Готово! Создано GIF-файлов: {len(created)}\n{names_list}"
                 )
                 await msg.delete()
             except Exception as e:
@@ -3047,163 +2447,27 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Bare "видео" / "ролик" — ask what to search ──────────────────────────
-    if VIDEO_BARE_RE.match(text):
-        await update.message.reply_text(
-            "🎬 Что найти? Напиши запрос, например:\n"
-            "• видео котики\n• трейлер Джокер\n• ролик как приготовить пасту"
-        )
-        return
-
-    # ── Direct video search: "видео <query>", "трейлер <query>", "найди видео <query>" ──
-    vs_match = VIDEO_SEARCH_RE.match(text)
-    if vs_match:
-        query = (vs_match.group(1) or vs_match.group(2) or "").strip()
-        if query:
-            await _handle_video_search(update, query)
-            return
-
     # Check if message is a music request ("музыка <query>")
     music_match = MUSIC_RE.match(text)
     if music_match:
         query = music_match.group(1).strip()
-        msg = await update.message.reply_text(f"🔍 Ищу: {query}…")
-        loop = asyncio.get_running_loop()
+        msg = await update.message.reply_text(f"🔍 Ищу: {query}...")
         try:
-            result, candidates, used_idx = await asyncio.wait_for(
-                loop.run_in_executor(_EXECUTOR, search_and_download_first_music, query),
-                timeout=150,
+            loop = asyncio.get_running_loop()
+            audio_bytes, title, artist = await loop.run_in_executor(
+                None, download_music, query
             )
-            audio_bytes, title, artist = result
-            music_search_state[user_id] = {"candidates": candidates, "idx": used_idx, "query": query}
-            await msg.edit_text("📤 Загружаю файл…")
-            await _safe_send_audio(
-                update.message, audio_bytes,
-                filename=f"{title}.mp3", title=title, performer=artist,
-                reply_markup=_music_keyboard(),
+            await msg.edit_text("📤 Загружаю файл...")
+            await update.message.reply_audio(
+                audio=io.BytesIO(audio_bytes),
+                filename=f"{title}.mp3",
+                title=title,
+                performer=artist,
             )
             await msg.delete()
-        except asyncio.TimeoutError:
-            await msg.edit_text("⏱ Превышено время ожидания. Попробуй ещё раз.")
         except Exception as e:
             await msg.edit_text(f"⚠ Ошибка: {e}")
         return
-
-    # ── Instagram: parse followers from a profile link ─────────────────────
-    ig_match = INSTAGRAM_RE.search(text)
-    if ig_match:
-        raw_slug = ig_match.group(1).lower().strip("/")
-        if raw_slug not in _IG_RESERVED:
-            target_user = raw_slug
-            loop = asyncio.get_running_loop()
-            ig_user_cfg = os.environ.get("INSTAGRAM_USERNAME", "")
-            ig_pass_cfg = os.environ.get("INSTAGRAM_PASSWORD", "")
-
-            if not ig_user_cfg or not ig_pass_cfg:
-                await update.message.reply_text(
-                    "⚙️ Для парсинга подписчиков Instagram нужен аккаунт-парсер.\n\n"
-                    "Настрой переменные окружения:\n"
-                    "• `INSTAGRAM_USERNAME` — логин аккаунта\n"
-                    "• `INSTAGRAM_PASSWORD` — пароль аккаунта\n\n"
-                    "⚠️ Используй отдельный аккаунт, не основной.",
-                    parse_mode="Markdown",
-                )
-                return
-
-            status = await update.message.reply_text(
-                f"📸 Подключаюсь к Instagram и собираю подписчиков @{target_user}…\n"
-                "⏳ Это может занять несколько минут."
-            )
-
-            last_progress = [0]
-
-            def _progress(done: int):
-                last_progress[0] = done
-
-            async def _update_progress():
-                while True:
-                    await asyncio.sleep(15)
-                    done = last_progress[0]
-                    if done > 0:
-                        try:
-                            await status.edit_text(
-                                f"📸 Собираю подписчиков @{target_user}…\n"
-                                f"✅ Собрано: {done} логинов"
-                            )
-                        except Exception:
-                            pass
-
-            progress_task = asyncio.create_task(_update_progress())
-
-            try:
-                usernames, display_name, total = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        _EXECUTOR,
-                        scrape_instagram_followers,
-                        target_user,
-                        _progress,
-                    ),
-                    timeout=None,
-                )
-            except asyncio.TimeoutError:
-                progress_task.cancel()
-                await status.edit_text("⏱ Превышено время ожидания. Попробуй позже.")
-                return
-            except RuntimeError as e:
-                progress_task.cancel()
-                err = str(e)
-                if "INSTAGRAM_CREDENTIALS_MISSING" in err:
-                    await status.edit_text("⚙️ Не заданы учётные данные Instagram.")
-                elif "INSTAGRAM_BAD_CREDENTIALS" in err:
-                    await status.edit_text("❌ Неверный логин или пароль Instagram-аккаунта парсера.")
-                elif "INSTAGRAM_2FA_REQUIRED" in err:
-                    await status.edit_text("❌ На аккаунте парсера включена двухфакторная аутентификация — отключи её.")
-                else:
-                    await status.edit_text(f"⚠ Ошибка: {err[:300]}")
-                return
-            except Exception as e:
-                progress_task.cancel()
-                await status.edit_text(f"⚠ Неожиданная ошибка: {e!s:.200}")
-                return
-
-            progress_task.cancel()
-
-            if not usernames:
-                await status.edit_text(
-                    f"😔 Не удалось получить подписчиков @{target_user}.\n"
-                    "Возможно, аккаунт закрытый или Instagram заблокировал запросы."
-                )
-                return
-
-            # Build .txt file
-            txt_content = "\n".join(usernames).encode("utf-8")
-            fname = f"followers_{target_user}.txt"
-            caption = (
-                f"📸 Подписчики @{target_user}"
-                + (f" ({display_name})" if display_name != target_user else "")
-                + f"\n👥 Всего подписчиков: {total:,}\n"
-                f"📋 Собрано логинов: {len(usernames):,}"
-            )
-            try:
-                await status.edit_text("📤 Отправляю файл…")
-                await update.message.reply_document(
-                    document=io.BytesIO(txt_content),
-                    filename=fname,
-                    caption=caption,
-                )
-                await status.delete()
-            except Exception as e:
-                await status.edit_text(f"⚠ Не удалось отправить файл: {e}")
-            return
-
-    # ── litterbox / filebin.net link → patch .exe ────────────────────────────
-    fh_match = FILEHOST_RE.search(text)
-    if fh_match:
-        url = fh_match.group(0)
-        if any(url.lower().endswith(ext) for ext in (".exe", ".bin", ".msi", ".zip")):
-            await _process_exe(update, context, url.split("/")[-1],
-                               source="filehost", filehost_url=url)
-            return
 
     # Check for VK / SoundCloud / Deezer audio links
     vk_match = VK_RE.search(text)
@@ -3222,14 +2486,53 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await update.message.reply_text(f"🎵 Скачиваю аудио с {source}...")
         try:
             loop = asyncio.get_running_loop()
-            audio_bytes, title, artist = await loop.run_in_executor(_EXECUTOR, download_audio_url, url)
-            await _safe_send_audio(
-                update.message, audio_bytes,
-                filename=f"{title}.mp3", title=title, performer=artist,
+            audio_bytes, title, artist = await loop.run_in_executor(None, download_audio_url, url)
+            await update.message.reply_audio(
+                audio=io.BytesIO(audio_bytes),
+                filename=f"{title}.mp3",
+                title=title,
+                performer=artist,
             )
             await msg.delete()
         except Exception as e:
             await msg.edit_text(f"⚠ {e}")
+        return
+
+    # ── Radio: "радио джаз", "включи рок радио", "хочу слушать радио" ───────
+    if RADIO_RE.search(text):
+        raw_genre = extract_radio_genre(text)
+        genre_key, yt_queries, streams = match_radio_genre(raw_genre)
+        genre_label = genre_key.capitalize() if genre_key else "музыка"
+        src_hint = "прямого стрима" if streams else "потока"
+        status = await update.message.reply_text(
+            f"📻 Ищу радио «{genre_label}» ({src_hint})…"
+        )
+        loop = asyncio.get_running_loop()
+        try:
+            audio_bytes, title = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, download_radio_audio, yt_queries, streams, genre_label
+                ),
+                timeout=300,
+            )
+        except asyncio.TimeoutError:
+            await status.edit_text("⏱ Превышено время ожидания. Попробуй ещё раз.")
+            return
+        except Exception as e:
+            await status.edit_text(f"⚠ Не удалось загрузить радио: {e}")
+            return
+        await status.edit_text("📤 Отправляю аудио…")
+        try:
+            size_mb = len(audio_bytes) / (1024 * 1024)
+            await update.message.reply_audio(
+                audio=io.BytesIO(audio_bytes),
+                title=title,
+                performer=f"📻 Радио · {genre_label}",
+                caption=f"🎵 {title}\n📻 Жанр: {genre_label} · {size_mb:.0f} МБ",
+            )
+            await status.delete()
+        except Exception as e:
+            await status.edit_text(f"⚠ Ошибка отправки: {e}")
         return
 
     # ── Image search: "покажи кота", "фото машины", "как выглядит ..." ────────
@@ -3242,7 +2545,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         try:
             results = await asyncio.wait_for(
-                loop.run_in_executor(_EXECUTOR, search_images, query, 5, True),
+                loop.run_in_executor(None, search_images, query, 5, True),
                 timeout=20,
             )
         except Exception:
@@ -3256,7 +2559,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for item in results:
             try:
                 img_bytes = await asyncio.wait_for(
-                    loop.run_in_executor(_EXECUTOR, download_image, item["url"]),
+                    loop.run_in_executor(None, download_image, item["url"]),
                     timeout=8,
                 )
                 from telegram import InputMediaPhoto as _IMP
@@ -3292,15 +2595,15 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         msg = await update.message.reply_text("🔍 Понимаю запрос…")
         try:
-            intent_data = await loop.run_in_executor(_EXECUTOR, classify_intent, text)
+            intent_data = await loop.run_in_executor(None, classify_intent, text)
             intent = intent_data.get("intent", "chat")
             query  = intent_data.get("query", text)
 
             if intent == "images":
                 await msg.edit_text(f"🖼 Ищу картинки: «{query}»…")
-                images = await loop.run_in_executor(_EXECUTOR, search_images, query, 5, True)
+                images = await loop.run_in_executor(None, search_images, query, 5, True)
                 if not images and query != text:
-                    images = await loop.run_in_executor(_EXECUTOR, search_images, text, 5, True)
+                    images = await loop.run_in_executor(None, search_images, text, 5, True)
                 if not images:
                     await msg.edit_text(
                         "😔 Не удалось найти картинки по этому запросу.\n"
@@ -3312,7 +2615,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for i, item in enumerate(images):
                     try:
                         img_bytes = await asyncio.wait_for(
-                            loop.run_in_executor(_EXECUTOR, download_image, item["url"]),
+                            loop.run_in_executor(None, download_image, item["url"]),
                             timeout=8,
                         )
                         media_group.append(InputMediaPhoto(
@@ -3337,34 +2640,32 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             if intent == "video":
-                await msg.delete()
-                await _handle_video_search(update, query)
+                await msg.edit_text(
+                    "⚠ Поиск видео по запросу недоступен.\n"
+                    "Отправь прямую ссылку на VK для скачивания видео."
+                )
                 return
 
             if intent == "music":
                 await msg.edit_text(f"🎵 Ищу музыку: «{query}»…")
                 try:
-                    result, candidates, used_idx = await asyncio.wait_for(
-                        loop.run_in_executor(_EXECUTOR, search_and_download_first_music, query),
-                        timeout=150,
+                    audio_bytes, title, artist = await loop.run_in_executor(
+                        None, download_music, query
                     )
-                    audio_bytes, title, artist = result
-                    music_search_state[user_id] = {"candidates": candidates, "idx": used_idx, "query": query}
-                    await _safe_send_audio(
-                        update.message, audio_bytes,
-                        filename=f"{title}.mp3", title=title, performer=artist,
-                        reply_markup=_music_keyboard(),
+                    await update.message.reply_audio(
+                        audio=io.BytesIO(audio_bytes),
+                        filename=f"{title}.mp3",
+                        title=title,
+                        performer=artist,
                     )
                     await msg.delete()
-                except asyncio.TimeoutError:
-                    await msg.edit_text("⏱ Превышено время ожидания. Попробуй ещё раз.")
                 except Exception as e:
                     await msg.edit_text(f"⚠ Не нашёл музыку: {e}")
                 return
 
             if intent == "info":
                 await msg.edit_text(f"🔍 Ищу информацию: «{query}»…")
-                answer, image_query = await loop.run_in_executor(_EXECUTOR, search_web_info, query)
+                answer, image_query = await loop.run_in_executor(None, search_web_info, query)
                 if not answer:
                     await msg.edit_text(
                         "😔 Не нашёл актуальной информации по этому запросу.\n"
@@ -3376,14 +2677,14 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     await msg.edit_text(answer)
                 if image_query:
-                    imgs = await loop.run_in_executor(_EXECUTOR, search_images, image_query, 3)
+                    imgs = await loop.run_in_executor(None, search_images, image_query, 3)
                     if imgs:
                         from telegram import InputMediaPhoto
                         media = []
                         for item in imgs:
                             try:
                                 img_bytes = await asyncio.wait_for(
-                                    loop.run_in_executor(_EXECUTOR, download_image, item["url"]),
+                                    loop.run_in_executor(None, download_image, item["url"]),
                                     timeout=8,
                                 )
                                 media.append(InputMediaPhoto(media=io.BytesIO(img_bytes)))
@@ -3411,7 +2712,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await update.message.reply_text("🔍 Ищу актуальную информацию…")
         try:
             # Use classify_intent to get an optimized search query
-            intent_data = await loop.run_in_executor(_EXECUTOR, classify_intent, text)
+            intent_data = await loop.run_in_executor(None, classify_intent, text)
             intent = intent_data.get("intent", "info")
             search_query = intent_data.get("query", text)
 
@@ -3429,14 +2730,14 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         await msg.edit_text(answer)
                     if image_query:
-                        imgs = await loop.run_in_executor(_EXECUTOR, search_images, image_query, 3)
+                        imgs = await loop.run_in_executor(None, search_images, image_query, 3)
                         if imgs:
                             from telegram import InputMediaPhoto
                             media = []
                             for item in imgs:
                                 try:
                                     img_bytes = await asyncio.wait_for(
-                                        loop.run_in_executor(_EXECUTOR, download_image, item["url"]),
+                                        loop.run_in_executor(None, download_image, item["url"]),
                                         timeout=8,
                                     )
                                     media.append(InputMediaPhoto(media=io.BytesIO(img_bytes)))
@@ -3458,9 +2759,15 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Regular AI chat
     loop = asyncio.get_running_loop()
 
+    # Fetch live weather in thread if asked
     system_extra = ""
+    if WEATHER_RE.search(text):
+        city = extract_city(text)
+        if city:
+            system_extra = await loop.run_in_executor(None, fetch_weather, city)
+
     try:
-        answer = await loop.run_in_executor(_EXECUTOR, ask_groq, user_id, text, system_extra)
+        answer = await loop.run_in_executor(None, ask_groq, user_id, text, system_extra)
         await update.message.reply_text(answer, reply_markup=main_keyboard())
     except Exception as e:
         await update.message.reply_text(f"⚠ Ошибка: {e}")
@@ -3578,6 +2885,191 @@ def rename_zip_by_dimensions(zip_bytes: bytes) -> tuple[bytes, int, int]:
     return out_buf.read(), total, renamed
 
 
+# ===== REVERSE IMAGE SEARCH =====
+
+_YANDEX_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _make_yandex_opener() -> urllib.request.OpenerDirector:
+    """Build an opener with a cookie jar and init a Yandex session."""
+    cj = _cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    try:
+        req = urllib.request.Request(
+            "https://yandex.ru/images/",
+            headers={
+                "User-Agent": _YANDEX_UA,
+                "Accept": "text/html,application/xhtml+xml,*/*",
+                "Accept-Language": "ru-RU,ru;q=0.9",
+            },
+        )
+        opener.open(req, timeout=12)
+    except Exception as e:
+        print(f"[yandex_session] init warning: {e}", flush=True)
+    return opener
+
+
+def _yandex_cbir_upload(opener: urllib.request.OpenerDirector,
+                         image_bytes: bytes, ext: str) -> tuple[str, str]:
+    """Upload image to Yandex via HTML form. Returns (final_url, html)."""
+    content_type_map = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "png": "image/png", "webp": "image/webp",
+        "gif": "image/gif", "bmp": "image/bmp",
+    }
+    mime = content_type_map.get(ext.lower(), "image/jpeg")
+    boundary = "----WebKitFormBoundaryYnDeZ9vvmB2iHa3W"
+
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="upfile"; filename="image.{ext}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n"
+    ).encode("utf-8") + image_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    # Use plain HTML upload endpoint (not JSON) — Yandex follows with a redirect
+    upload_url = "https://yandex.ru/images/search?rpt=imageview"
+
+    req = urllib.request.Request(
+        upload_url,
+        data=body,
+        headers={
+            "User-Agent": _YANDEX_UA,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+            "Referer": "https://yandex.ru/images/",
+            "Origin": "https://yandex.ru",
+        },
+    )
+
+    with opener.open(req, timeout=40) as resp:
+        final_url = resp.geturl()
+        html = resp.read().decode("utf-8", errors="ignore")
+
+    print(f"[yandex_upload] final_url={final_url[:200]}", flush=True)
+
+    # Verify cbir_id is in the final URL
+    parsed = urllib.parse.urlparse(final_url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    cbir_id = qs.get("cbir_id", [None])[0]
+
+    if not cbir_id:
+        # Try to find in HTML
+        m = re.search(r'cbir[_-]id[=:]["\']?([A-Za-z0-9/_\-]{5,})', html)
+        if m:
+            cbir_id = m.group(1)
+
+    if not cbir_id:
+        raise RuntimeError(
+            f"Яндекс не вернул cbir-id.\n"
+            f"URL после загрузки: {final_url[:200]}"
+        )
+
+    print(f"[yandex_upload] cbir_id={cbir_id}", flush=True)
+    return final_url, html
+
+
+def _extract_image_urls(html: str) -> list[str]:
+    """Extract candidate original image URLs from Yandex results page HTML."""
+    seen: set[str] = set()
+    out: list[str] = []
+
+    bad = {"yandex.ru", "yandex.net", "yandex.com", "ya.ru",
+           "avatars.mds", "mc.yandex", "clck.ru"}
+    bad_parts = {"thumb", "thumbnail", "favicon", "icon",
+                 "avatar", "logo", "sprite", "pixel", "1x1"}
+    bad_exts = {".svg", ".ico", ".css", ".js", ".woff", ".woff2", ".ttf"}
+
+    def ok(url: str) -> bool:
+        u = url.lower()
+        if any(d in u for d in bad):
+            return False
+        if any(p in u for p in bad_parts):
+            return False
+        path = u.split("?")[0]
+        if any(path.endswith(e) for e in bad_exts):
+            return False
+        return True
+
+    patterns = [
+        r'"originUrl"\s*:\s*"(https?://[^"]{10,})"',
+        r'"imgUrl"\s*:\s*"(https?://[^"]{10,})"',
+        r'"url"\s*:\s*"(https?://[^"]{10,}\.(?:jpe?g|png|webp|bmp)[^"]*)"',
+        r'(https?://[^\s"\'<>]{20,}\.(?:jpe?g|png|webp|bmp)(?:\?[^\s"\'<>]*)?)',
+    ]
+
+    for pat in patterns:
+        for m in re.finditer(pat, html, re.IGNORECASE):
+            url = m.group(1).replace("\\/", "/").replace("\\u002F", "/")
+            if url not in seen and ok(url):
+                seen.add(url)
+                out.append(url)
+        if len(out) >= 25:
+            break
+
+    return out[:25]
+
+
+def find_original_image(image_bytes: bytes, ext: str = "jpg") -> tuple[bytes, str]:
+    opener = _make_yandex_opener()
+    # Upload returns (final_url, html) — no need for a second request
+    _final_url, html = _yandex_cbir_upload(opener, image_bytes, ext)
+
+    candidates = _extract_image_urls(html)
+    print(f"[yandex_results] {len(candidates)} candidates", flush=True)
+
+    if not candidates:
+        raise RuntimeError(
+            "Оригинал не найден: Яндекс не вернул ссылки на изображения.\n"
+            "Попробуй другое фото."
+        )
+
+    MAX_SIZE = 50 * 1024 * 1024
+
+    for url in candidates:
+        try:
+            dl_req = urllib.request.Request(
+                url,
+                headers={"User-Agent": _YANDEX_UA},
+            )
+            with urllib.request.urlopen(dl_req, timeout=20) as resp:
+                ct = resp.headers.get("Content-Type", "")
+                if not any(t in ct for t in ["image/", "octet-stream"]):
+                    continue
+                data = resp.read()
+
+            if len(data) < 5000 or len(data) > MAX_SIZE:
+                continue
+
+            try:
+                chk = Image.open(io.BytesIO(data))
+                chk.verify()
+            except Exception:
+                continue
+
+            url_path = url.split("?")[0]
+            url_ext = url_path.rsplit(".", 1)[-1].lower()
+            if url_ext not in ("jpg", "jpeg", "png", "webp", "gif", "bmp"):
+                url_ext = "jpg" if "jpeg" in ct or "jpg" in ct else (
+                    "png" if "png" in ct else ("webp" if "webp" in ct else "jpg")
+                )
+
+            print(f"[yandex_dl] OK {len(data)//1024}KB {url[:80]}", flush=True)
+            return data, url_ext
+
+        except Exception as e:
+            print(f"[yandex_dl] skip {url[:60]}: {e}", flush=True)
+            continue
+
+    raise RuntimeError(
+        "Не удалось скачать ни один из найденных оригиналов.\n"
+        "Источники закрыты или требуют авторизации."
+    )
+
 
 async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle images sent as files (uncompressed documents)."""
@@ -3587,7 +3079,32 @@ async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     caption = (update.message.caption or "").strip()
 
-    if UPSCALE_RE.search(caption):
+    if FIND_IMG_RE.search(caption):
+        msg = await update.message.reply_text("🔍 Ищу оригинал изображения в интернете...")
+        try:
+            file = await context.bot.get_file(doc.file_id)
+            dl = io.BytesIO()
+            await file.download_to_memory(dl)
+            img_bytes = dl.getvalue()
+            ext = (doc.file_name or "image.jpg").rsplit(".", 1)[-1].lower()
+            if ext not in ("jpg", "jpeg", "png", "webp", "gif", "bmp"):
+                ext = "jpg"
+            loop = asyncio.get_running_loop()
+            result_bytes, result_ext = await loop.run_in_executor(
+                None, find_original_image, img_bytes, ext
+            )
+            size_kb = len(result_bytes) / 1024
+            size_str = f"{size_kb / 1024:.1f} МБ" if size_kb > 1024 else f"{size_kb:.0f} КБ"
+            await update.message.reply_document(
+                document=io.BytesIO(result_bytes),
+                filename=f"original.{result_ext}",
+                caption=f"✅ Найден оригинал — {size_str}",
+            )
+            await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"⚠ {e}")
+
+    elif UPSCALE_RE.search(caption):
         msg = await update.message.reply_text("🔬 Увеличиваю фото в 3x...")
         try:
             file = await context.bot.get_file(doc.file_id)
@@ -3609,8 +3126,8 @@ async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_T
                 size_mb = len(result_bytes) / (1024 * 1024)
                 filename = "upscaled_3x.jpg"
                 fmt = "JPEG"
-            await _safe_send_doc(
-                update.message, result_bytes,
+            await update.message.reply_document(
+                document=io.BytesIO(result_bytes),
                 filename=filename,
                 caption=(
                     f"✅ Готово! Увеличено в 3x ({fmt})\n"
@@ -3629,7 +3146,7 @@ async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_T
             dl = io.BytesIO()
             await file.download_to_memory(dl)
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(_EXECUTOR, analyze_text_percentage, dl.getvalue())
+            result = await loop.run_in_executor(None, analyze_text_percentage, dl.getvalue())
             await update.message.reply_text(f"📊 {result}")
             await msg.delete()
         except Exception as e:
@@ -3663,353 +3180,11 @@ async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(
             "📷 Изображение получено!\n\n"
             "Что я умею с фото:\n"
+            "• Подпиши «найди» или «оригинал» — найду оригинал в интернете (до 50МБ)\n"
             "• Подпиши «улучши фото» — увеличу в 3x\n"
-            "• Подпиши «процент текста» — определю долю текста\n"
-            "• Для сжатия — отправь ZIP-архив с картинками и подпиши «до 512кб»"
+            "• Подпиши «до 500кб» (любой размер) — сожму\n"
+            "• Подпиши «процент текста» — определю долю текста"
         )
-
-
-FILEHOST_RE = re.compile(
-    r'https?://(?:'
-    r'files\.catbox\.moe/\S+'
-    r'|litter\.catbox\.moe/\S+'
-    r'|0x0\.st/\S+'
-    r'|filebin\.net/\S+'
-    r')',
-    re.IGNORECASE,
-)
-
-
-def upload_to_filehost(data: bytes, filename: str) -> str:
-    """Upload file to one of several file hosts (tries each in order).
-    Returns a URL string. Raises RuntimeError if all fail."""
-    import requests as _req
-    import uuid as _uuid
-
-    size_mb = len(data) / (1024 * 1024)
-    errors = []
-
-    # ── 1. gofile.io — unlimited size, no account, accepts .exe ───────────
-    try:
-        srv_r = _req.get("https://api.gofile.io/servers", timeout=15)
-        srv_r.raise_for_status()
-        server = srv_r.json()["data"]["servers"][0]["name"]
-        r = _req.post(
-            f"https://{server}.gofile.io/contents/uploadfile",
-            files={"file": (filename, data, "application/octet-stream")},
-            timeout=180,
-        )
-        r.raise_for_status()
-        page = r.json().get("data", {}).get("downloadPage", "")
-        if page.startswith("https://"):
-            print(f"[upload] gofile.io OK: {page}", flush=True)
-            return f"{page}  (gofile.io · {size_mb:.1f} МБ)"
-    except Exception as e:
-        errors.append(f"gofile.io: {e}")
-
-    # ── 2. temp.sh — direct link, simple PUT ──────────────────────────────
-    try:
-        r = _req.post(
-            "https://temp.sh/upload",
-            files={"file": (filename, data, "application/octet-stream")},
-            timeout=180,
-        )
-        r.raise_for_status()
-        url = r.text.strip()
-        if url.startswith("https://"):
-            print(f"[upload] temp.sh OK: {url}", flush=True)
-            return f"{url}  (temp.sh · {size_mb:.1f} МБ)"
-    except Exception as e:
-        errors.append(f"temp.sh: {e}")
-
-    # ── 3. filebin.net — bin-page, no size limit ──────────────────────────
-    try:
-        bin_id = _uuid.uuid4().hex[:16]
-        safe_name = re.sub(r"[^\w.\-]", "_", filename)
-        r = _req.post(
-            f"https://filebin.net/{bin_id}/{safe_name}",
-            data=data,
-            headers={"Content-Type": "application/octet-stream"},
-            timeout=180,
-        )
-        if r.status_code in (200, 201):
-            page = f"https://filebin.net/{bin_id}"
-            print(f"[upload] filebin.net OK: {page}", flush=True)
-            return f"{page}  (filebin.net · {size_mb:.1f} МБ · файл: {safe_name})"
-    except Exception as e:
-        errors.append(f"filebin.net: {e}")
-
-    # ── 4. litterbox.catbox.moe — 72h, wraps non-zip in zip ───────────────
-    try:
-        if not filename.lower().endswith(".zip"):
-            _zbuf = io.BytesIO()
-            with zipfile.ZipFile(_zbuf, "w", zipfile.ZIP_DEFLATED) as _zf:
-                _zf.writestr(filename, data)
-            upload_data = _zbuf.getvalue()
-            upload_name = filename + ".zip"
-        else:
-            upload_data = data
-            upload_name = filename
-        r = _req.post(
-            "https://litterbox.catbox.moe/resources/internals/api.php",
-            data={"reqtype": "fileupload", "time": "72h"},
-            files={"fileToUpload": (upload_name, upload_data, "application/zip")},
-            timeout=180,
-        )
-        r.raise_for_status()
-        url = r.text.strip()
-        if url.startswith("https://"):
-            note = f" (внутри архива: {filename})" if upload_name != filename else ""
-            print(f"[upload] litterbox OK: {url}", flush=True)
-            return f"{url}  (litterbox · {size_mb:.1f} МБ{note})"
-    except Exception as e:
-        errors.append(f"litterbox: {e}")
-
-    raise RuntimeError(
-        "Не удалось загрузить файл ни на один хостинг.\n"
-        + "\n".join(f"• {e}" for e in errors)
-    )
-
-
-def download_from_filehost(url: str) -> tuple[bytes, str]:
-    """Download a file from litterbox / filebin.net / other filehost. Returns (bytes, filename)."""
-    import requests as _req
-    headers = {"Accept": "application/octet-stream"}
-    r = _req.get(url, timeout=120, stream=True, headers=headers)
-    r.raise_for_status()
-    data = r.content
-    filename = url.rstrip("/").split("/")[-1] or "file.exe"
-    return data, filename
-
-
-def extract_exe_contents(exe_bytes: bytes, filename: str) -> tuple[bytes, int, list[str]]:
-    """
-    Extract files from a .exe installer (NSIS, Inno Setup, SFX, etc.) using 7z.
-    Returns (zip_bytes, file_count, file_list).
-    """
-    import subprocess
-    with tempfile.TemporaryDirectory() as tmpdir:
-        exe_path = os.path.join(tmpdir, filename)
-        out_dir = os.path.join(tmpdir, "extracted")
-        os.makedirs(out_dir, exist_ok=True)
-        with open(exe_path, "wb") as f:
-            f.write(exe_bytes)
-
-        result = subprocess.run(
-            ["7z", "x", exe_path, f"-o{out_dir}", "-y", "-bd"],
-            capture_output=True, text=True, timeout=60
-        )
-
-        extracted = []
-        for root, dirs, files in os.walk(out_dir):
-            for fname in files:
-                extracted.append(os.path.join(root, fname))
-
-        if not extracted:
-            err = result.stdout[-500:] + result.stderr[-500:]
-            raise RuntimeError(f"Не удалось извлечь файлы.\n7z вывод:\n{err[:400]}")
-
-        zip_buf = io.BytesIO()
-        base_name = os.path.splitext(filename)[0]
-        file_list = []
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for fpath in extracted:
-                arcname = os.path.relpath(fpath, out_dir)
-                file_list.append(arcname)
-                zf.write(fpath, arcname)
-
-        zip_bytes = zip_buf.getvalue()
-        return zip_bytes, len(extracted), file_list
-
-
-def _patch_exe_remove_admin(data: bytes) -> tuple[bytes, bool]:
-    """Remove requireAdministrator from PE manifest via same-length binary replacement.
-    Returns (patched_bytes, was_patched)."""
-    # UTF-8 variants (double-quote and single-quote)
-    patterns = [
-        (b'level="requireAdministrator"', b'level="asInvoker"           '),
-        (b"level='requireAdministrator'", b"level='asInvoker'           "),
-    ]
-    # UTF-16LE variants
-    for find_s, repl_s in list(patterns):
-        patterns.append((
-            find_s.decode().encode("utf-16-le"),
-            repl_s.decode().encode("utf-16-le"),
-        ))
-
-    patched = data
-    was_patched = False
-    for find, repl in patterns:
-        assert len(find) == len(repl), f"length mismatch: {len(find)} vs {len(repl)}"
-        if find in patched:
-            patched = patched.replace(find, repl)
-            was_patched = True
-    return patched, was_patched
-
-
-def _patch_all_in_zip(data: bytes):
-    """Patch all .exe/.msi/.bin files in a ZIP archive in-place.
-    Returns (patched_zip_bytes, patched_count, total_exe_count)."""
-    in_zf = zipfile.ZipFile(io.BytesIO(data), "r")
-    names = in_zf.namelist()
-    if not names:
-        raise RuntimeError("ZIP-архив пустой.")
-    exe_names = [n for n in names if n.lower().endswith((".exe", ".msi", ".bin"))]
-    out_buf = io.BytesIO()
-    patched_count = 0
-    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as out_zf:
-        for name in names:
-            entry_bytes = in_zf.read(name)
-            if name.lower().endswith((".exe", ".msi", ".bin")):
-                entry_bytes, was = _patch_exe_remove_admin(entry_bytes)
-                if was:
-                    patched_count += 1
-            out_zf.writestr(name, entry_bytes)
-    in_zf.close()
-    return out_buf.getvalue(), patched_count, len(exe_names)
-
-
-async def exe_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc.file_name or not doc.file_name.lower().endswith(".exe"):
-        return
-
-    await _process_exe(update, context, doc.file_name,
-                       source="telegram", file_id=doc.file_id)
-
-
-async def _process_exe(update, context, filename: str,
-                       source: str, file_id: str = None,
-                       filehost_url: str = None):
-    """Download EXE, patch manifest to remove admin rights, send back or upload."""
-    msg = await update.message.reply_text(
-        f"📥 Получил *{filename}*\n🔧 Убираю требование прав администратора…",
-        parse_mode="Markdown"
-    )
-    try:
-        loop = asyncio.get_running_loop()
-
-        # ── Download ──────────────────────────────────────────────────────────
-        if source == "telegram":
-            file = await context.bot.get_file(file_id)
-            dl = io.BytesIO()
-            await file.download_to_memory(dl)
-            exe_bytes = dl.getvalue()
-        else:
-            await msg.edit_text(f"📥 Скачиваю *{filename}*…", parse_mode="Markdown")
-            exe_bytes, filename = await loop.run_in_executor(
-                _EXECUTOR, download_from_filehost, filehost_url
-            )
-            # Если прислали ZIP — патчим всё внутри и возвращаем новый ZIP
-            if filename.lower().endswith(".zip"):
-                await msg.edit_text(
-                    f"📦 Распаковываю *{filename}*, патчу exe…", parse_mode="Markdown"
-                )
-
-                def _patch_all_in_zip(data: bytes):
-                    in_zf = zipfile.ZipFile(io.BytesIO(data), "r")
-                    names = in_zf.namelist()
-                    if not names:
-                        raise RuntimeError("ZIP-архив пустой.")
-                    exe_names = [n for n in names
-                                 if n.lower().endswith((".exe", ".msi", ".bin"))]
-                    if not exe_names:
-                        raise RuntimeError("В ZIP-архиве не найдено ни одного .exe файла.")
-                    out_buf = io.BytesIO()
-                    patched_count = 0
-                    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as out_zf:
-                        for name in names:
-                            entry_bytes = in_zf.read(name)
-                            if name.lower().endswith((".exe", ".msi", ".bin")):
-                                entry_bytes, was = _patch_exe_remove_admin(entry_bytes)
-                                if was:
-                                    patched_count += 1
-                            out_zf.writestr(name, entry_bytes)
-                    in_zf.close()
-                    return out_buf.getvalue(), patched_count, len(exe_names)
-
-                zip_out, patched_count, total_exe = await loop.run_in_executor(
-                    _EXECUTOR, _patch_all_in_zip, exe_bytes
-                )
-
-                # Имя выходного архива
-                base = filename[:-4] if filename.lower().endswith(".zip") else filename
-                out_zip_name = base + "_patched.zip"
-                patch_note = (
-                    f"✅ Пропатчено {patched_count} из {total_exe} exe-файлов — "
-                    f"права администратора убраны."
-                    if patched_count
-                    else "ℹ Ни один exe в архиве не требовал прав администратора."
-                )
-
-                _TELEGRAM_SEND_LIMIT = 50 * 1024 * 1024
-                size_mb = len(zip_out) / (1024 * 1024)
-                if len(zip_out) <= _TELEGRAM_SEND_LIMIT:
-                    await msg.edit_text("📤 Отправляю архив…")
-                    await update.message.reply_document(
-                        document=io.BytesIO(zip_out),
-                        filename=out_zip_name,
-                        caption=f"{patch_note}\n📦 {out_zip_name} · {size_mb:.1f} МБ",
-                    )
-                else:
-                    await msg.edit_text(f"📤 Архив {size_mb:.1f} МБ — загружаю на файлохостинг…")
-                    dl_link = await loop.run_in_executor(
-                        _EXECUTOR, upload_to_filehost, zip_out, out_zip_name
-                    )
-                    await update.message.reply_text(
-                        f"{patch_note}\n\n📦 Скачать: {dl_link}\n📁 Размер: {size_mb:.1f} МБ"
-                    )
-                await msg.delete()
-                return
-
-            elif not filename.lower().endswith((".exe", ".msi", ".bin")):
-                await msg.edit_text(
-                    "⚠ Файл не является .exe — загрузи правильный файл и попробуй снова."
-                )
-                return
-
-        # ── Patch manifest ────────────────────────────────────────────────────
-        await msg.edit_text(f"🔧 Патчу *{filename}*…", parse_mode="Markdown")
-        patched_bytes, was_patched = await loop.run_in_executor(
-            _EXECUTOR, _patch_exe_remove_admin, exe_bytes
-        )
-
-        patch_note = (
-            "✅ Требование прав администратора убрано."
-            if was_patched
-            else "ℹ Файл не требовал прав администратора (манифест не изменён)."
-        )
-
-        # ── Send or upload ────────────────────────────────────────────────────
-        _TELEGRAM_SEND_LIMIT = 50 * 1024 * 1024
-        size_mb = len(patched_bytes) / (1024 * 1024)
-
-        if len(patched_bytes) <= _TELEGRAM_SEND_LIMIT:
-            await msg.edit_text("📤 Отправляю файл…")
-            await update.message.reply_document(
-                document=io.BytesIO(patched_bytes),
-                filename=filename,
-                caption=f"{patch_note}\n📦 {filename} · {size_mb:.1f} МБ",
-            )
-            await msg.delete()
-        else:
-            await msg.edit_text(f"📤 Файл {size_mb:.1f} МБ — загружаю на файлохостинг…")
-            dl_link = await loop.run_in_executor(
-                _EXECUTOR, upload_to_filehost, patched_bytes, filename
-            )
-            await update.message.reply_text(
-                f"{patch_note}\n\n"
-                f"📦 Скачать: {dl_link}\n"
-                f"📁 Размер: {size_mb:.1f} МБ"
-            )
-            await msg.delete()
-
-    except asyncio.TimeoutError:
-        await msg.edit_text("⏱ Превышено время ожидания.")
-    except RuntimeError as e:
-        await msg.edit_text(f"⚠ {e}")
-    except Exception as e:
-        await msg.edit_text(f"⚠ Ошибка: {e!s:.300}")
 
 
 async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4019,118 +3194,37 @@ async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     caption = (update.message.caption or "").strip()
     user_id = update.message.from_user.id
-    original_name = os.path.splitext(doc.file_name)[0]
 
-    # ── Download archive (no hard size block — let API error handle it) ──────
-    msg = await update.message.reply_text("📥 Скачиваю архив…")
-    try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        dl = io.BytesIO()
-        await tg_file.download_to_memory(dl)
-        zip_bytes = dl.getvalue()
-    except Exception as e:
-        err_str = str(e)
-        size_mb = (doc.file_size or 0) / (1024 * 1024)
-        if "too big" in err_str.lower() or "file is too big" in err_str.lower() or size_mb > 20:
-            await msg.edit_text(
-                f"⚠ Архив {size_mb:.0f} МБ — Telegram не позволяет ботам скачивать файлы >20 МБ.\n\n"
-                "Загрузи архив на gofile.io или filebin.net и пришли ссылку — "
-                "я всё равно его пропатчу."
-            )
-        else:
-            await msg.edit_text(f"⚠ Не удалось скачать архив: {e}")
-        return
-
-    loop = asyncio.get_running_loop()
-
-    # ── Route 1: GIF builder ─────────────────────────────────────────────────
     if GIF_CMD_RE.search(caption):
-        gif_pending[user_id] = {"zip_bytes": zip_bytes, "step": "fps"}
-        await msg.edit_text(
-            "⏱ Сколько секунд на один кадр?\n"
-            "Напиши число, например: `0.5` или `1`",
-            parse_mode="Markdown"
-        )
-        return
-
-    # ── Route 2: Compress images ─────────────────────────────────────────────
-    target_bytes = parse_target_size(caption)
-    if target_bytes:
-        await msg.edit_text("🗜 Сжимаю картинки в архиве…")
+        msg = await update.message.reply_text("📥 Получил архив. Скачиваю...")
         try:
-            result_bytes, total, compressed_count = await loop.run_in_executor(
-                None, compress_zip_images, zip_bytes, target_bytes
-            )
-            if total == 0:
-                await msg.edit_text("⚠ В архиве не найдено ни одного изображения.")
-                return
-            target_kb = target_bytes / 1024
-            target_str = f"{target_kb / 1024:.1f} МБ" if target_kb >= 1024 else f"{target_kb:.0f} КБ"
-            await _safe_send_doc(
-                update.message, result_bytes,
-                filename=f"{original_name}_compressed.zip",
-                caption=(
-                    f"✅ Готово!\n"
-                    f"📸 Изображений в архиве: {total}\n"
-                    f"🗜 Сжато (превышали {target_str}): {compressed_count}\n"
-                    f"⏭ Без изменений: {total - compressed_count}"
-                ),
-            )
-            await msg.delete()
-        except Exception as e:
-            await msg.edit_text(f"⚠ Ошибка: {e}")
-        return
-
-    # ── Route 3: Patch EXE — auto-detect or explicit caption ─────────────────
-    _PATCH_RE = re.compile(
-        r'\b(патч|patch|убери|убрать|сними|снять|удали|удалить).*(?:права|админ|administrator|admin|uac)\b'
-        r'|(?:права|админ|administrator|admin|uac).*\b(убери|убрать|сними|снять|удали|patch)\b',
-        re.IGNORECASE,
-    )
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as _zf:
-            exe_files_in_zip = [n for n in _zf.namelist()
-                                if n.lower().endswith((".exe", ".msi", ".bin"))]
-    except Exception:
-        exe_files_in_zip = []
-
-    if exe_files_in_zip or _PATCH_RE.search(caption):
-        if not exe_files_in_zip:
-            await msg.edit_text("⚠ В архиве не найдено ни одного .exe файла.")
-            return
-        await msg.edit_text(
-            f"🔧 Найдено {len(exe_files_in_zip)} exe-файл(ов). Патчу — убираю права администратора…"
-        )
-        try:
-            zip_out, patched_count, total_exe = await loop.run_in_executor(
-                _EXECUTOR, _patch_all_in_zip, zip_bytes
+            file = await context.bot.get_file(doc.file_id)
+            dl = io.BytesIO()
+            await file.download_to_memory(dl)
+            gif_pending[user_id] = {"zip_bytes": dl.getvalue(), "step": "fps"}
+            await msg.edit_text(
+                "⏱ Сколько секунд на один кадр?\n"
+                "Напиши число, например: `0.5` или `1`",
+                parse_mode="Markdown"
             )
         except Exception as e:
-            await msg.edit_text(f"⚠ Ошибка при патче: {e}")
-            return
-
-        patch_note = (
-            f"✅ Пропатчено {patched_count} из {total_exe} exe-файлов — права администратора убраны."
-            if patched_count
-            else "ℹ Ни один exe в архиве не требовал прав администратора."
-        )
-        out_zip_name = f"{original_name}_patched.zip"
-        await _safe_send_doc(
-            update.message, zip_out,
-            filename=out_zip_name,
-            caption=f"{patch_note}\n📦 {out_zip_name} · {len(zip_out) / (1024*1024):.1f} МБ",
-        )
-        await msg.delete()
+            await msg.edit_text(f"⚠ Ошибка при загрузке архива: {e}")
         return
 
-    # ── Route 4: Rename images by dimensions (default) ───────────────────────
-    await msg.edit_text("📦 Переименовываю файлы в архиве…")
+    msg = await update.message.reply_text("📦 Переименовываю файлы в архиве...")
     try:
+        file = await context.bot.get_file(doc.file_id)
+        dl = io.BytesIO()
+        await file.download_to_memory(dl)
+
+        loop = asyncio.get_running_loop()
         result_bytes, total, renamed = await loop.run_in_executor(
-            None, rename_zip_by_dimensions, zip_bytes
+            None, rename_zip_by_dimensions, dl.getvalue()
         )
-        await _safe_send_doc(
-            update.message, result_bytes,
+
+        original_name = os.path.splitext(doc.file_name)[0]
+        await update.message.reply_document(
+            document=io.BytesIO(result_bytes),
             filename=f"{original_name}_renamed.zip",
             caption=f"✅ Готово: {renamed} из {total} файлов переименованы по размеру в пикселях",
         )
@@ -4141,21 +3235,6 @@ async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ===== START BOT =====
 
-async def _on_startup(application):
-    """Delete any active webhook before switching to polling mode. Retries until confirmed."""
-    import asyncio as _asyncio
-    for attempt in range(5):
-        try:
-            await application.bot.delete_webhook(drop_pending_updates=True)
-            wh = await application.bot.get_webhook_info()
-            if not wh.url:
-                print("✅ Webhook deleted, polling mode active", flush=True)
-                return
-        except Exception as e:
-            print(f"[startup] delete_webhook attempt {attempt+1}: {e}", flush=True)
-        await _asyncio.sleep(2)
-    print("⚠ Could not confirm webhook deletion after 5 attempts", flush=True)
-
 app = (
     ApplicationBuilder()
     .token(TELEGRAM_TOKEN)
@@ -4164,29 +3243,11 @@ app = (
     .write_timeout(120)
     .pool_timeout(30)
     .concurrent_updates(True)
-    .post_init(_on_startup)
     .build()
 )
 
-_last_webhook_delete: float = 0.0
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    import traceback, time as _time
-    from telegram.error import Conflict as _Conflict
-
-    # Webhook conflict: another instance has set a webhook — silently re-delete it
-    if isinstance(context.error, _Conflict):
-        global _last_webhook_delete
-        now = _time.monotonic()
-        if now - _last_webhook_delete > 30:  # throttle: max once per 30 s
-            _last_webhook_delete = now
-            try:
-                await context.bot.delete_webhook(drop_pending_updates=True)
-                print("[startup] Conflict → webhook re-deleted", flush=True)
-            except Exception:
-                pass
-        return  # don't log full traceback for Conflict
-
+    import traceback
     err_text = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
     print(f"[ERROR] {err_text}", flush=True)
     if update and hasattr(update, "message") and update.message:
@@ -4206,7 +3267,6 @@ app.add_handler(MessageHandler(filters.VIDEO, video_handler))
 app.add_handler(MessageHandler(filters.Document.VIDEO, video_handler))
 app.add_handler(MessageHandler(filters.Document.IMAGE, image_document_handler))
 app.add_handler(MessageHandler(filters.Document.FileExtension("zip"), zip_rename_handler))
-app.add_handler(MessageHandler(filters.Document.FileExtension("exe"), exe_handler))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 app.add_error_handler(error_handler)
 
