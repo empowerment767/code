@@ -1,17 +1,19 @@
-import concurrent.futures
-import http.cookiejar as _cookiejar
+import asyncio
+import html as _html
 import io
 import json
 import os
 import re
+import socket
 import tempfile
-import threading
 import urllib.parse
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from openai import OpenAI
 from PIL import Image
+from rembg import remove as rembg_remove
 import yt_dlp
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -23,55 +25,9 @@ from telegram.ext import (
 # ===== TOKENS =====
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8610501182:AAF_w5tOE446-4DaXJztk2dlh13rcX526Kk")
 GROQ_API_KEY   = os.environ.get("GROQ_API_KEY",   "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")
-WEBHOOK_HOST   = os.environ.get("WEBHOOK_HOST") or os.environ.get("VERCEL_URL", "")
-WEBHOOK_PATH   = os.environ.get("WEBHOOK_PATH", "/api/webhook")
-PORT           = int(os.environ.get("PORT", "10000"))
 
-# ===== PERSISTENT STORAGE =====
-_DATA_DIR = os.environ.get("DATA_DIR") or (tempfile.gettempdir() if os.environ.get("VERCEL") else ".")
-try:
-    os.makedirs(_DATA_DIR, exist_ok=True)
-except Exception:
-    _DATA_DIR = tempfile.gettempdir()
-
-# ===== USER STORAGE =====
-_USERS_FILE = os.path.join(_DATA_DIR, "bot_users.json")
-_users_lock = threading.Lock()
-
-def _load_users() -> set:
-    try:
-        with open(_USERS_FILE, "r", encoding="utf-8") as _f:
-            return set(json.load(_f))
-    except Exception:
-        return set()
-
-def _save_users(users: set):
-    try:
-        with open(_USERS_FILE, "w", encoding="utf-8") as _f:
-            json.dump(list(users), _f)
-    except Exception:
-        pass
-
-known_users: set = _load_users()
-
-def _register_user(user_id: int):
-    with _users_lock:
-        if user_id not in known_users:
-            known_users.add(user_id)
-            _save_users(known_users)
-
-# ===== BROADCAST STATE =====
-broadcast_pending: set = set()  # owner user_ids waiting to send a broadcast
-
-# ===== YOUTUBE COOKIES =====
-_YT_COOKIE_FILE: str | None = None
-_yt_cookies_raw = os.environ.get("YOUTUBE_COOKIES", "")
-if _yt_cookies_raw.strip():
-    _cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-    with open(_cookie_path, "w", encoding="utf-8") as _cf:
-        _cf.write(_yt_cookies_raw)
-    _YT_COOKIE_FILE = _cookie_path
-    print(f"✅ YouTube cookies loaded ({len(_yt_cookies_raw)} bytes)", flush=True)
+# Optional: paste Netscape-format YouTube cookies here or in env var YOUTUBE_COOKIES
+YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "")
 
 # ===== GROQ CLIENT =====
 groq_client = OpenAI(
@@ -79,25 +35,20 @@ groq_client = OpenAI(
     base_url="https://api.groq.com/openai/v1"
 )
 
-GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-
 # ===== MEMORY =====
 user_memory = {}
-_memory_lock = threading.Lock()
-_user_locks: dict[int, asyncio.Lock] = {}
-
-def _get_user_lock(user_id: int) -> asyncio.Lock:
-    if user_id not in _user_locks:
-        _user_locks[user_id] = asyncio.Lock()
-    return _user_locks[user_id]
 
 # ===== FONT STATE =====
 font_pending = {}  # user_id -> font_name
 
-# ===== GIF BUILD STATE =====
-gif_pending = {}  # user_id -> {"zip_bytes": bytes, "step": "fps"} | {..., "step": "maxsize", "fps": float}
-GIF_CMD_RE = re.compile(r'собери\s*гиф', re.IGNORECASE)
+# ===== "ЕЩЕ" CACHE =====
+# user_id -> {"type": "shorts"|"tiktok"|"video"|"music", "query": str, "entries": list, "index": int}
+user_more_cache: dict = {}
 
+MORE_RE = re.compile(
+    r'^\s*(?:ещ[её]|еще|more|ещ[её]?\s+один|ещ[её]?\s+раз|другой|другое|другую|следующ\w+|next)\s*[!?.]*\s*$',
+    re.IGNORECASE
+)
 
 STYLE_ALIASES = {
     "regular":        "Regular",
@@ -125,6 +76,24 @@ STYLE_ALIASES = {
 }
 
 # ===== URL PATTERNS =====
+INSTAGRAM_RE = re.compile(
+    r'https?://(?:www\.)?instagram\.com/(?:p|reel|tv|stories)/[\w\-]+'
+)
+YOUTUBE_RE = re.compile(
+    r'https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)[\w\-]+'
+)
+SHORTS_SEARCH_RE = re.compile(
+    r'(?:пришли|найди|скачай|покажи|дай)?\s*шортс[ы]?\s+(.+)',
+    re.IGNORECASE
+)
+TIKTOK_SEARCH_RE = re.compile(
+    r'(?:пришли|найди|скачай|покажи|дай)?\s*тикток\s+(.+)',
+    re.IGNORECASE
+)
+TIKTOK_URL_RE = re.compile(
+    r'https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[\w@/\-\.]+'
+)
+
 VK_RE = re.compile(
     r'https?://(?:www\.)?vk\.com/(?:video[\-\d_]+|music/album/[\w\-]+|wall[\-\d_]+|clip[\-\d_]+)'
 )
@@ -134,12 +103,23 @@ SOUNDCLOUD_RE = re.compile(
 DEEZER_RE = re.compile(
     r'https?://(?:www\.)?deezer\.com/(?:\w+/)?(?:track|album|playlist)/\d+'
 )
+PROXY_RE = re.compile(
+    r'^\s*(?:прокси|proxy|прокс[иы]|vpn|впн|найди\s+прокси|дай\s+прокси|пришли\s+прокси)\s*$',
+    re.IGNORECASE
+)
+
 # Telegram bot file size limit: 50 MB
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
-# Global thread pool — shared across all blocking I/O and CPU tasks
-_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=20, thread_name_prefix="bot"
+
+# ===== WEATHER KEYWORDS =====
+WEATHER_RE = re.compile(
+    r'\b(?:weather|погода[а-яё]*|прогноз|температур[а-яё]*|climate)\b',
+    re.IGNORECASE
+)
+CITY_RE = re.compile(
+    r'(?:в|in|для|for|во)\s+([А-ЯЁа-яёA-Za-z][а-яёa-z\-A-Za-z\s]{1,30}?)(?:\s*[?,.]|$)',
+    re.IGNORECASE
 )
 
 
@@ -148,28 +128,47 @@ def get_current_datetime() -> str:
     return now.strftime("Текущая дата и время (UTC): %d.%m.%Y %H:%M")
 
 
-_CJK_RE = re.compile(
-    r'[\u2E80-\u2EFF\u2F00-\u2FDF\u3000-\u303F\u3040-\u309F\u30A0-\u30FF'
-    r'\u3100-\u312F\u3200-\u32FF\u3300-\u33FF\u3400-\u4DBF\u4E00-\u9FFF'
-    r'\uF900-\uFAFF\uFE30-\uFE4F\U00020000-\U0002A6DF\U0002A700-\U0002CEAF]'
-)
+def fetch_weather(city: str) -> str:
+    city = city.strip()
+    encoded = urllib.parse.quote(city)
+    url = f"https://wttr.in/{encoded}?format=j1"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        cur = data["current_condition"][0]
+        desc_list = cur.get("lang_ru") or cur.get("weatherDesc") or [{"value": ""}]
+        desc = desc_list[0]["value"]
+        temp     = cur["temp_C"]
+        feels    = cur["FeelsLikeC"]
+        humidity = cur["humidity"]
+        wind     = cur["windspeedKmph"]
+        return (
+            f"[Реальная погода в {city}: {desc}, "
+            f"температура {temp}°C (ощущается {feels}°C), "
+            f"влажность {humidity}%, ветер {wind} км/ч]"
+        )
+    except Exception:
+        return ""
 
-def _strip_cjk(text: str) -> str:
-    """Remove CJK (Chinese/Japanese/Korean) characters from text."""
-    return _CJK_RE.sub('', text)
+
+def extract_city(text: str) -> str:
+    m = CITY_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    return ""
 
 
 def build_system_prompt(extra: str = "") -> str:
     base = (
         get_current_datetime() + ".\n\n"
-        "Ты — конкретный чувак, не робот и не ассистент. Общаешься жёстко и по-простому, без всякого пафоса. "
-        "Материшься свободно и часто — блять, хуй, пиздец, нахуй, ёбаный, хуёво, заебись — используй их естественно в речи, "
-        "как обычный русский мужик разговаривает с корешем. Не стесняйся, не цензуришь себя. "
-        "Никогда не говоришь что ты ИИ или бот, не извиняешься за мат, никаких дисклеймеров и предупреждений. "
-        "Мнение высказываешь прямо и резко. Можешь послать, подколоть, пошутить грубо. "
-        "Пишешь ТОЛЬКО обычным русским текстом — никаких escape-последовательностей, никаких \\u символов, "
-        "никакой кодировки в тексте — только живые русские слова. "
-        "При вопросах о текущей дате или времени — используй данные выше."
+        "Ты — живой чувак, не робот и не ассистент. Общаешься как реальный человек: "
+        "по-простому, без пафоса, иногда грубовато. Используешь матерные слова там, где это уместно — "
+        "естественно, не через каждое слово, а как обычный русскоязычный человек в разговоре с другом. "
+        "Никогда не говоришь что ты ИИ или бот, не извиняешься за мат, не добавляешь дисклеймеры. "
+        "Мнение своё высказываешь прямо. Можешь подколоть, пошутить, поспорить. "
+        "При вопросах о текущей дате или времени — используй данные выше. "
+        "При вопросах о погоде — используй данные ниже, если они есть."
     )
     if extra:
         base += "\n" + extra
@@ -189,37 +188,26 @@ def main_keyboard():
 
 # ===== GROQ FUNCTION =====
 def ask_groq(user_id, prompt, system_extra: str = ""):
-    with _memory_lock:
-        history = list(user_memory.get(user_id, []))
+    history = user_memory.get(user_id, [])
     history.append({"role": "user", "content": prompt})
 
     messages = [{"role": "system", "content": build_system_prompt(system_extra)}] + history
 
     response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
+        model="moonshotai/kimi-k2-instruct-0905",
         messages=messages
     )
 
-    answer = _strip_cjk(response.choices[0].message.content)
+    answer = response.choices[0].message.content
     history.append({"role": "assistant", "content": answer})
-    with _memory_lock:
-        user_memory[user_id] = history[-10:]
+    user_memory[user_id] = history[-10:]
     return answer
 
 
 # ===== FONT DOWNLOAD =====
 
-FONT_RE          = re.compile(r'^шрифт\s+(.+)$', re.IGNORECASE)
-MUSIC_RE         = re.compile(r'^музыка\s+(.+)$', re.IGNORECASE)
-VIDEO_SEARCH_RE  = re.compile(
-    r'^(?:'
-    r'(?:найди|пришли|скачай|покажи|хочу\s+(?:посмотреть|увидеть))\s+(?:видео|ролик|клип|трейлер)\s+(.+)'
-    r'|(?:видео|ролик|трейлер)\s+(.+)'
-    r')$',
-    re.IGNORECASE | re.DOTALL
-)
-# Catch bare "видео" / "ролик" / "трейлер" with no query
-VIDEO_BARE_RE = re.compile(r'^(видео|ролик|трейлер|клип)$', re.IGNORECASE)
+FONT_RE     = re.compile(r'^шрифт\s+(.+)$', re.IGNORECASE)
+MUSIC_RE    = re.compile(r'^музыка\s+(.+)$', re.IGNORECASE)
 
 # Regex to detect "fetch media from internet" intent (pre-filter before Groq classification)
 INTERNET_RE = re.compile(
@@ -229,11 +217,6 @@ INTERNET_RE = re.compile(
     r'|видео|видеоурок|видео-?инструк|туториал|урок|ролик|клип|музык|саундтрек'
     r'|ost|трек|песн|soundtrack|song|track|music)',
     re.IGNORECASE | re.DOTALL,
-)
-# Catch standalone "тикток" / "шортс" requests (with or without topic)
-TIKTOK_SHORTS_RE = re.compile(
-    r'\b(тикток|тиктоки|tiktok|шортс|шортсы|shorts)\b',
-    re.IGNORECASE,
 )
 # Also catch "музыка из фильма/игры/сериала" without leading verb
 MEDIA_FROM_RE = re.compile(
@@ -245,71 +228,31 @@ PHOTO_GUIDE_RE = re.compile(
     r'\b(как|how).{0,80}\b(картинк|фото|пошагово|по шагам|step.?by.?step|инструкц|схем)',
     re.IGNORECASE | re.DOTALL,
 )
-
-# Catch image search requests: "покажи кота", "найди фото моря", "картинку котика"
-IMAGE_RE = re.compile(
-    r'(?:'
-    r'покажи(?:\s+мне)?'
-    r'|покажите'
-    r'|хочу\s+посмотреть'
-    r'|хочу\s+увидеть'
-    r'|пришли\s+(?:фото|картинк|изображени|фотк)'
-    r'|отправь\s+(?:фото|картинк|изображени)'
-    r'|кинь\s+(?:фото|картинк|изображени)'
-    r'|найди\s+(?:фото|картинк|изображени|фотографи)'
-    r'|дай\s+(?:фото|картинк|изображени)'
-    r'|как\s+выглядит'
-    r'|как\s+выглядят'
-    r'|покажи\s+как\s+выглядит'
-    r'|фото\s+\w'
-    r'|картинк[уи]\s+\w'
-    r'|картинки\s+\w'
-    r'|изображени[ея]\s+\w'
-    r'|фотк[уи]\s+\w'
-    r'|фоточк[уи]\s+\w'
-    r'|скинь\s+(?:фото|картинк|изображени)'
-    r')',
-    re.IGNORECASE,
-)
-
-# Trigger verbs that signal "send me something"
-SEND_TRIGGER_RE = re.compile(
-    r'\b(покажи(?:те)?|пришли|найди|дай|кинь|скинь|отправь|хочу\s+(?:увидеть|посмотреть))\b',
-    re.IGNORECASE,
-)
-
 # Catch factual/informational queries that need real web search
 INFO_RE = re.compile(
-    r'(?:'
-    # Classic info/knowledge questions
-    r'что\s+такое\b|кто\s+такой\b|кто\s+такая\b'
+    r'\b(?:'
+    r'что\s+такое'
+    r'|кто\s+такой'
+    r'|кто\s+такая'
     r'|расскажи\s+(?:про|о|об)\b'
     r'|информаци[яю]\s+(?:про|о|об)\b'
     r'|факты\s+(?:про|о|об)\b'
     r'|история\s+(?:создания|возникновения|развития|появления|про|о|об)\b'
-    r'|как\s+работает\b|как\s+устроен\b'
+    r'|как\s+работает\b'
+    r'|как\s+устроен\b'
     r'|из\s+чего\s+(?:состоит|сделан|делают)\b'
-    r'|чем\s+знаменит\b|что\s+известно\s+о\b'
-    r'|tell\s+me\s+about\b|what\s+is\b|who\s+is\b|history\s+of\b|facts\s+about\b|how\s+does\b'
-    # Real-time / local queries
-    r'|сеанс[ыа]?\b|расписани[ея]\b|афиш[аы]?\b'
-    r'|кинотеатр\w*\b'
-    r'|что\s+(?:идёт|показывают|сейчас\s+идёт)\b'
-    r'|какой\s+фильм|какие\s+фильмы|какое\s+кино'
-    r'|сколько\s+стоит\b|цена\s+(?:на|за)\b|стоимость\b'
-    r'|режим\s+работы\b|часы\s+работы\b|график\s+работы\b'
-    r'|где\s+(?:купить|найти|заказать|находится|расположен\w*)\b'
-    r'|открыт\w*\s+ли\b|работает\s+ли\b'
-    r'|курс\s+(?:доллара|евро|рубля|валют)\b'
-    r'|новости\s+(?:о|про|по|в)\b'
-    r'|последние\s+новости\b'
-    r'|что\s+(?:нового|случилось|произошло|происходит)\b'
-    r'|когда\s+(?:открывается|закрывается|начинается|заканчивается)\b'
-    r'|адрес\s+\w|телефон\s+\w'
-    r'|(?:latest|current|today|now|schedule|showtimes?|cinema|movie\s+times?)\b'
+    r'|чем\s+знаменит\b'
+    r'|что\s+известно\s+о\b'
+    r'|tell\s+me\s+about\b'
+    r'|what\s+is\b'
+    r'|who\s+is\b'
+    r'|history\s+of\b'
+    r'|facts\s+about\b'
+    r'|how\s+does\b'
     r')',
     re.IGNORECASE,
 )
+
 
 def classify_intent(text: str) -> dict:
     """Ask Groq to classify what kind of media the user wants.
@@ -317,7 +260,7 @@ def classify_intent(text: str) -> dict:
     """
     try:
         resp = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
+            model="moonshotai/kimi-k2-instruct-0905",
             messages=[
                 {
                     "role": "system",
@@ -325,14 +268,14 @@ def classify_intent(text: str) -> dict:
                         "You are a strict intent classifier. Analyze the user message and return JSON.\n\n"
                         "Fields:\n"
                         "- intent: exactly one of 'images', 'video', 'music', 'info', 'chat'\n"
-                        "- query: optimized search query in the SAME language as the user's message\n\n"
+                        "- query: optimized English or Russian search query for the best result\n\n"
                         "Classification rules (apply in order):\n"
                         "1. Use 'images' when user wants: photos, pictures, diagrams, step-by-step photo "
                         "instructions, schemes, illustrations, how-to images, instruction pictures.\n"
                         "   Examples: 'пришли инструкцию в картинках', 'покажи фото', 'как это выглядит', "
                         "'схема подключения', 'пошаговые фото'.\n"
                         "2. Use 'video' when user wants: a video, tutorial video, video instructions, "
-                        "how-to video, video guide, video lesson.\n"
+                        "how-to video, video guide, youtube video, video lesson.\n"
                         "   Examples: 'пришли видео инструкцию', 'найди ролик', 'видеоурок', 'покажи видео'.\n"
                         "3. Use 'music' when user wants: a song, music track, soundtrack, OST from a "
                         "movie/game/show/series/anime, background music, theme song.\n"
@@ -342,28 +285,20 @@ def classify_intent(text: str) -> dict:
                         "If a specific song title is mentioned, use 'Artist - Song Title'. "
                         "If no specific song is mentioned, use 'Game/Movie Name song official audio'.\n"
                         "4. Use 'info' when user wants factual information, explanations, history, "
-                        "biography, science, news, definitions, any knowledge search, OR real-time/local "
-                        "information such as: cinema schedules, showtimes, event schedules, store hours, "
-                        "prices, addresses, phone numbers, weather, currency rates, current news, "
-                        "what's on at a specific place right now.\n"
+                        "biography, science, news, definitions, or any knowledge search.\n"
                         "   Examples: 'найди информацию о', 'что такое', 'кто такой', 'расскажи о', "
-                        "'как работает', 'история', 'факты о', 'tell me about', 'what is', 'who is', "
-                        "'какие сеансы в кинотеатре', 'расписание', 'сколько стоит', 'режим работы', "
-                        "'что сейчас показывают', 'showtimes', 'schedule', 'cinema', 'movie times'.\n"
-                        "   For info: query should be a clear, specific search query in the user's language "
-                        "optimized for finding this exact info (include city name, venue name, dates if mentioned).\n"
-                        "5. Use 'chat' ONLY for: jokes, creative writing, personal opinions, small talk, "
-                        "greetings, hypothetical discussions. If in doubt between 'info' and 'chat' — choose 'info'.\n\n"
+                        "'как работает', 'история', 'факты о', 'tell me about', 'what is', 'who is'.\n"
+                        "   For info: query should be a clear, concise English or Russian search query.\n"
+                        "5. Use 'chat' for everything else (jokes, creative writing, personal chat, opinions).\n\n"
                         "Query optimization rules:\n"
-                        "- NEVER translate the query. Keep it in the EXACT same language as the user's message.\n"
-                        "- For images: make it descriptive for image search, add equivalent of 'step by step' in user's language if instructional.\n"
-                        "- For video: add words like 'урок', 'инструкция', 'tutorial' only matching user's language if instructional.\n"
-                        "- For music from game (no specific song): use the game name as the user wrote it, plus word for 'music' in user's language. Example (Russian): 'NFS Underground 2 музыка'. Example (English): 'NFS Underground 2 music'. Never add 'full soundtrack', 'compilation', 'full OST'.\n"
-                        "- For music from movie (no specific song): use the movie name as the user wrote it plus 'музыка' (Russian) or 'music' (English).\n"
-                        "- For info: keep the query focused and specific to the topic, preserve original language.\n"
-                        "- CRITICAL: The query field must ALWAYS be in the same language as the user's message. Russian input → Russian query. English input → English query.\n\n"
+                        "- For images: make it descriptive for image search, add 'step by step' if instructional.\n"
+                        "- For video: add 'tutorial' or 'how to' if instructional.\n"
+                        "- For music from game (no specific song): use 'Game Name best song official audio'. Never add 'full soundtrack' or 'compilation'.\n"
+                        "- For music from movie (no specific song): use 'Movie Name theme song official audio'.\n"
+                        "- For info: keep the query focused on the topic, translate to English for better results.\n"
+                        "- Keep the query in the same language as the user or translate to English for better results.\n\n"
                         "Return ONLY valid JSON, no markdown, no explanation:\n"
-                        "{\"intent\": \"images\", \"query\": \"замена кухонного смесителя пошагово\"}"
+                        "{\"intent\": \"images\", \"query\": \"how to replace kitchen faucet step by step\"}"
                     ),
                 },
                 {"role": "user", "content": text},
@@ -382,655 +317,154 @@ def classify_intent(text: str) -> dict:
         return {"intent": "chat", "query": text}
 
 
-
-
-def _fetch_page_text(url: str, max_chars: int = 4000) -> str:
-    """Fetch a URL and return clean readable text (no HTML tags)."""
+def search_images(query: str, max_results: int = 6) -> list[bytes]:
+    """Search DuckDuckGo for images and return list of raw image bytes."""
     try:
-        import requests as _req
-        from bs4 import BeautifulSoup as _BS
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        }
-        resp = _req.get(url, headers=headers, timeout=8, allow_redirects=True)
-        resp.encoding = resp.apparent_encoding
-        soup = _BS(resp.text, "lxml")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
-            tag.decompose()
-        text = " ".join(soup.get_text(" ", strip=True).split())
-        return text[:max_chars]
-    except Exception as e:
-        print(f"[fetch_page error] {url}: {e}", flush=True)
-        return ""
+        from ddgs import DDGS as _DDGS
+    except ImportError:
+        try:
+            from duckduckgo_search import DDGS as _DDGS
+        except ImportError:
+            return []
 
-
-_SKIP_DOMAINS = {"youtube.com", "youtu.be", "facebook.com",
-                 "twitter.com", "t.me", "vk.com", "tiktok.com", "pdf"}
-
-
-def _should_fetch(url: str) -> bool:
-    return not any(d in url for d in _SKIP_DOMAINS) and not url.endswith(".pdf")
-
-
-def search_web_info(text: str) -> tuple[str | None, str]:
-    """
-    Returns (answer_text or None, image_search_query or "").
-    """
-    return None, ""
-
-
-
-
-def _fetch_video_entries_dm(query: str, count: int = 10) -> list[dict]:
-    """Search Dailymotion for video entries."""
-    flat_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "noplaylist": True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(flat_opts) as ydl:
-            meta = ydl.extract_info(f"dmsearch{count}:{query}", download=False)
-        entries = meta.get("entries", []) if meta else []
-        result = []
-        for e in entries:
-            vid_id = e.get("id") or ""
-            if not vid_id:
-                continue
-            url = e.get("url") or e.get("webpage_url") or f"https://www.dailymotion.com/video/{vid_id}"
-            result.append({
-                "id": vid_id,
-                "url": url,
-                "title": e.get("title") or query,
-                "duration": e.get("duration"),
-            })
-        return result
-    except Exception:
-        return []
-
-
-def _fetch_video_entries_vimeo(query: str, count: int = 10) -> list[dict]:
-    """Search Vimeo for video entries."""
-    flat_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "noplaylist": True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(flat_opts) as ydl:
-            meta = ydl.extract_info(f"vmsearch{count}:{query}", download=False)
-        entries = meta.get("entries", []) if meta else []
-        result = []
-        for e in entries:
-            vid_id = e.get("id") or ""
-            if not vid_id:
-                continue
-            url = e.get("url") or e.get("webpage_url") or f"https://vimeo.com/{vid_id}"
-            result.append({
-                "id": vid_id,
-                "url": url,
-                "title": e.get("title") or query,
-                "duration": e.get("duration"),
-            })
-        return result
-    except Exception:
-        return []
-
-
-def _search_rutube(query: str, count: int = 10) -> list[dict]:
-    """Search Rutube via its public search API and return video entries."""
-    try:
-        import urllib.parse as _up
-        q = _up.quote(query)
-        api_url = f"https://rutube.ru/api/search/video/?query={q}&page=1&format=json"
-        req = urllib.request.Request(api_url, headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json",
-        })
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        results = data.get("results", [])
-        entries = []
-        for r in results[:count]:
-            vid_id = r.get("id") or ""
-            if not vid_id:
-                continue
-            if r.get("is_deleted") or r.get("is_hidden") or r.get("is_paid"):
-                continue
-            url = r.get("video_url") or f"https://rutube.ru/video/{vid_id}/"
-            entries.append({
-                "id": vid_id,
-                "url": url,
-                "title": r.get("title") or query,
-                "duration": r.get("duration"),
-            })
-        return entries
-    except Exception:
-        return []
-
-
-def _kp_find_film_id(query: str) -> tuple[str, str] | None:
-    """
-    Search Kinopoisk for the movie and return (film_id, title), or None.
-    Tries the search page __NEXT_DATA__ JSON, then falls back to URL pattern matching.
-    """
-    import json as _json
-    import urllib.parse as _up
-
-    q_enc = _up.quote(query)
+    collected: list[bytes] = []
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-    }
-
-    # Method 1: Scrape the search results page
-    try:
-        url = f"https://www.kinopoisk.ru/search/?text={q_enc}&type=movie"
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-
-        # Look for __NEXT_DATA__ embedded JSON
-        nd = re.search(r'id="__NEXT_DATA__"[^>]*>(\{.*?\})</script>', html, re.DOTALL)
-        if nd:
-            try:
-                data = _json.loads(nd.group(1))
-                # Walk through common data paths
-                for path in [
-                    ["props", "pageProps", "searchResults", "films", "items"],
-                    ["props", "pageProps", "searchData", "items"],
-                    ["props", "pageProps", "films"],
-                ]:
-                    try:
-                        node = data
-                        for k in path:
-                            node = node[k]
-                        if node and isinstance(node, list):
-                            f = node[0]
-                            fid = str(f.get("id") or f.get("filmId") or f.get("kinopoiskId") or "")
-                            title = (
-                                (f.get("title") or {}).get("russian")
-                                or (f.get("title") or {}).get("original")
-                                or f.get("nameRu") or f.get("nameEn")
-                                or query
-                            )
-                            if fid.isdigit():
-                                return fid, title
-                    except (KeyError, TypeError, IndexError):
-                        continue
-            except _json.JSONDecodeError:
-                pass
-
-        # Fallback: scan /film/ID/ href patterns from the HTML
-        film_ids = re.findall(r'href=["\'](?:https://www\.kinopoisk\.ru)?/film/(\d{4,})[/"\'?]', html)
-        if film_ids:
-            return film_ids[0], query
-    except Exception as e:
-        print(f"[_kp_find_film_id] {e}", flush=True)
-
-    # Method 2: Kinopoisk suggest API (Yandex CDN)
-    try:
-        sug_url = (
-            f"https://suggest-kinopoisk.yandex.net/suggest-kinopoisk"
-            f"?srv=kinopoisk&part={q_enc}&limit=5&lang=ru"
         )
-        req2 = urllib.request.Request(sug_url, headers={
-            "User-Agent": headers["User-Agent"],
-            "Referer": "https://www.kinopoisk.ru/",
-        })
-        with urllib.request.urlopen(req2, timeout=8) as resp2:
-            raw = resp2.read().decode("utf-8", errors="replace")
-        data2 = _json.loads(raw)
-        # Response: [query, [items...], [], [metadata...]] or {"data": [...]}
-        items = None
-        if isinstance(data2, list) and len(data2) > 1 and isinstance(data2[1], list):
-            items = data2[1]
-        elif isinstance(data2, dict):
-            items = data2.get("data") or data2.get("items") or []
-        if items:
-            for item in items:
-                if isinstance(item, dict):
-                    fid = str(item.get("id") or item.get("entityId") or "")
-                    typ = str(item.get("type") or item.get("entityType") or "").lower()
-                    title = item.get("title") or item.get("name") or query
-                    if fid.isdigit() and ("film" in typ or "movie" in typ or typ == ""):
-                        return fid, title
-    except Exception as e:
-        print(f"[_kp_find_film_id suggest] {e}", flush=True)
-
-    return None
-
-
-# YouTube clients that don't require cookies/sign-in (most reliable first)
-# tv_embedded: most formats; android variants: bypass bot-detection better
-_YT_CLIENTS = ["tv_embedded", "android_embedded", "android_vr", "android"]
-
-_IS_YT_URL = re.compile(r'youtube\.com|youtu\.be', re.IGNORECASE)
-
-_YT_BOT_ERRORS = ("sign in", "bot", "429", "confirm", "cookies", "age")
-
-
-def _download_video_url(url: str, title_fallback: str = "") -> tuple[bytes, str]:
-    """Download a video from any yt-dlp supported URL. Returns (bytes, title)."""
-    import subprocess
-
-    is_yt = bool(_IS_YT_URL.search(url))
-    clients_to_try = _YT_CLIENTS if is_yt else [None]
-
-    formats = [
-        "best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/best",
-        "worst[ext=mp4]/worst",
-    ]
-
-    for client in clients_to_try:
-        client_failed_with_auth = False
-        for fmt in formats:
-            try:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    extra = {
-                        "format": fmt,
-                        "outtmpl": os.path.join(tmpdir, "video.%(ext)s"),
-                        "noplaylist": True,
-                        "merge_output_format": "mp4",
-                    }
-                    if client:
-                        extra["extractor_args"] = {"youtube": {"player_client": [client]}}
-                    opts = _base_opts(tmpdir, extra)
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                    filepath = _find_file(tmpdir, preferred_ext=".mp4")
-                    size = os.path.getsize(filepath)
-                    if size > MAX_FILE_SIZE:
-                        small_path = os.path.join(tmpdir, "small.mp4")
-                        r = subprocess.run(
-                            ["ffmpeg", "-y", "-i", filepath,
-                             "-vf", "scale=-2:480", "-c:v", "libx264",
-                             "-crf", "28", "-preset", "fast",
-                             "-c:a", "aac", "-b:a", "96k", small_path],
-                            capture_output=True,
-                        )
-                        if r.returncode == 0 and os.path.exists(small_path):
-                            new_size = os.path.getsize(small_path)
-                            if new_size <= MAX_FILE_SIZE:
-                                filepath = small_path
-                            else:
-                                continue
-                        else:
-                            continue
-                    title = (info or {}).get("title", title_fallback) if isinstance(info, dict) else title_fallback
-                    with open(filepath, "rb") as f:
-                        return f.read(), title or title_fallback
-            except Exception as e:
-                err = str(e).lower()
-                if is_yt and any(k in err for k in _YT_BOT_ERRORS):
-                    client_failed_with_auth = True
-                    break  # this client is blocked, try next client
-                continue
-        if client_failed_with_auth:
-            continue  # try next YouTube client
-
-    raise RuntimeError(f"Не удалось скачать видео: {url[:80]}")
-
-
-def _fetch_video_entries_yt(query: str, count: int = 20, max_dur: int = 720) -> list[dict]:
-    """Search YouTube for video entries — no API key required (yt_dlp ytsearch)."""
-    flat_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "noplaylist": True,
-        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
     }
     try:
-        with yt_dlp.YoutubeDL(flat_opts) as ydl:
-            meta = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
-        entries = meta.get("entries", []) if meta else []
-        result = []
-        for e in entries:
-            vid_id = e.get("id") or ""
-            if not vid_id:
+        ddgs = _DDGS()
+        results = ddgs.images(query, max_results=max_results * 4)
+        for r in results:
+            url = r.get("image") or r.get("url")
+            if not url:
                 continue
-            duration = e.get("duration") or 0
-            # Skip compilations and very long videos
-            if duration and duration > max_dur:
-                continue
-            title = e.get("title") or query
-            title_l = title.lower()
-            # Skip obvious compilations
-            if any(k in title_l for k in ("compilation", "сборник", "подборка", "топ ", "нон-стоп",
-                                           "hours", "часов", "нонстоп", "best of", "greatest")):
-                continue
-            url = (
-                e.get("url")
-                or e.get("webpage_url")
-                or f"https://www.youtube.com/watch?v={vid_id}"
-            )
-            result.append({
-                "id": f"yt_{vid_id}",
-                "url": url,
-                "title": title,
-                "duration": duration,
-                "platform": "YouTube",
-            })
-        return result
-    except Exception:
-        return []
-
-
-def _translate_query_to_en(query: str) -> str | None:
-    """
-    Simple transliteration/common-name lookup for popular search terms.
-    Returns an English version of a Russian-language query, or None.
-    """
-    _ru_to_en = {
-        "мистер бин": "Mr Bean",
-        "гарри поттер": "Harry Potter",
-        "властелин колец": "Lord of the Rings",
-        "звёздные войны": "Star Wars",
-        "звездные войны": "Star Wars",
-        "мстители": "Avengers",
-        "человек паук": "Spider-Man",
-        "бэтмен": "Batman",
-        "супермен": "Superman",
-        "терминатор": "Terminator",
-        "матрица": "The Matrix",
-        "интерстеллар": "Interstellar",
-        "форсаж": "Fast and Furious",
-        "шрек": "Shrek",
-        "симпсоны": "The Simpsons",
-        "том и джерри": "Tom and Jerry",
-        "спанч боб": "SpongeBob",
-        "губка боб": "SpongeBob",
-        "рик и морти": "Rick and Morty",
-        "ведьмак": "The Witcher",
-        "игра престолов": "Game of Thrones",
-        "сорвиголова": "Daredevil",
-        "джокер": "Joker",
-        "аватар": "Avatar",
-        "пираты карибского": "Pirates of the Caribbean",
-    }
-    q_lower = query.strip().lower()
-    for ru, en in _ru_to_en.items():
-        if ru in q_lower:
-            return q_lower.replace(ru, en)
-    return None
-
-
-def _collect_video_entries(query: str) -> list[dict]:
-    """
-    Gather video candidates from YouTube with multiple query variants.
-    Strategy:
-      1. Primary query — keep YouTube's relevance order (most relevant first).
-      2. Supplement with English variant / "+видео" if primary finds too few.
-      3. Fallback to 20-min limit only when primary finds nothing at all.
-    """
-    en_query = _translate_query_to_en(query)
-
-    def _fetch(q: str, max_dur: int) -> list[dict]:
-        return _fetch_video_entries_yt(q, count=20, max_dur=max_dur)
-
-    # ── Step 1: primary query (strict 12-min limit) ─────────────────────────
-    primary = _fetch(query, 720)
-
-    # ── Step 2: run supplementary searches in parallel ───────────────────────
-    supp_tasks: list[tuple[str, int]] = []
-    if en_query:
-        supp_tasks.append((en_query, 720))
-    # "+видео" helps when the plain query returns mostly music videos
-    supp_tasks.append((query + " видео", 720))
-    # Fallback with relaxed duration (20 min) when primary is dry
-    if len(primary) < 3:
-        supp_tasks.append((query, 1200))
-        if en_query:
-            supp_tasks.append((en_query, 1200))
-
-    supp: list[dict] = []
-    if supp_tasks:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(supp_tasks)) as pool:
-            fs = {pool.submit(_fetch, q, d): (q, d) for q, d in supp_tasks}
-            for future in concurrent.futures.as_completed(fs, timeout=22):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = resp.read()
+                if len(data) < 2000:
+                    continue
+                # Validate it's a real image
                 try:
-                    supp.extend(future.result())
+                    Image.open(io.BytesIO(data)).verify()
                 except Exception:
-                    pass
-
-    # ── Merge: primary first (relevance-ordered), then supplements ───────────
-    seen_ids: set[str] = set()
-    all_entries: list[dict] = []
-
-    for e in primary:
-        eid = e.get("id") or e.get("url", "")[:40]
-        if eid not in seen_ids:
-            seen_ids.add(eid)
-            all_entries.append(e)
-
-    # Supplements: sort shorter-first so we try smaller files earlier
-    supp.sort(key=lambda e: (e.get("duration") or 9999))
-    for e in supp:
-        eid = e.get("id") or e.get("url", "")[:40]
-        if eid not in seen_ids:
-            seen_ids.add(eid)
-            all_entries.append(e)
-
-    return all_entries
+                    continue
+                collected.append(data)
+                if len(collected) >= max_results:
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return collected
 
 
-def _video_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("▶️ Следующий", callback_data="next_video"),
-    ]])
-
-
-# ── Persistent state for video "Next" button ───────────────────────────────
-# Maps user_id → {"query": str, "entries": [...], "sent_ids": set}
-video_search_state: dict[int, dict] = {}
-
-# ── Persistent state for music "Ещё" button ────────────────────────────────
-# Maps user_id → {"query": str, "queries": [str,...], "idx": int}
-music_search_state: dict[int, dict] = {}
-
-def _music_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Ещё", callback_data="next_music"),
-    ]])
-
-
-def _is_artist_only(query: str) -> bool:
-    """Return True if query looks like just an artist name (no specific song title)."""
-    q = query.strip()
-    if any(sep in q for sep in (" - ", " – ", " — ")):
-        return False
-    song_hints = ("official", "lyrics", "audio", "video", "feat", "ft.", "remix",
-                  "acoustic", "live", "(", "cover", "original", "instrumental")
-    if any(k in q.lower() for k in song_hints):
-        return False
-    return len(q.split()) <= 4
-
-
-def _filter_music_entry(title: str, duration) -> bool:
-    """Return True if this track entry is a normal single track (not a compilation)."""
-    if not title:
-        return False
-    dur = duration or 0
-    if dur and (dur < 55 or dur > 620):
-        return False
-    skip_kw = (
-        "full album", "greatest hits", "compilation", "playlist", "best of",
-        "megamix", "medley", "non-stop", "nonstop", "1 hour", "2 hour", "10 hour",
-        "сборник", "все хиты", "подборка", "микс", "all songs", "full ost",
-    )
-    title_l = title.lower()
-    if any(k in title_l for k in skip_kw):
-        return False
-    return True
-
-
-def search_music_candidates(query: str) -> list[dict]:
+def search_web_info(text: str) -> tuple[str | None, str]:
     """
-    Search SoundCloud + YouTube (+ Rutube) and collect candidate tracks.
-    Returns list of {url, title, source, duration} — does NOT download anything.
+    Search DuckDuckGo text for factual information, synthesize a structured answer via Groq.
+    Returns (answer_text or None, image_search_query or "").
+    image_search_query is non-empty only when the topic benefits from visual illustration.
     """
-    is_artist = _is_artist_only(query)
-
-    if is_artist:
-        # For artist-only: search directly by name (SoundCloud returns actual artist tracks)
-        sc_queries = [query, f"{query} official"]
-        yt_queries = [f"{query} official music video", f"{query} popular songs", f"{query} top hits"]
-        rt_queries = [f"{query} официальный", query]
-    else:
-        sc_queries = [query, f"{query} official audio"]
-        yt_queries = [query, f"{query} official audio", f"{query} audio"]
-        rt_queries = [query]
-
-    candidates: list[dict] = []
-    seen: set[str] = set()
-    artist_norm = re.sub(r'\W+', ' ', query.lower()).strip() if is_artist else ""
-
-    def _norm(t: str) -> str:
-        return re.sub(r'\W+', ' ', t.lower()).strip()
-
-    def _uploader_matches(entry: dict) -> bool:
-        """True if this track is by the queried artist (for artist-only searches)."""
-        if not is_artist:
-            return True
-        uploader = (entry.get("uploader") or entry.get("channel") or "").lower()
-        uploader_norm = re.sub(r'\W+', ' ', uploader).strip()
-        return artist_norm in uploader_norm or uploader_norm in artist_norm
-
-    def _add(entry: dict, source: str):
-        title = (entry.get("title") or "").strip()
-        url = entry.get("url") or entry.get("webpage_url") or ""
-        dur = entry.get("duration")
-        if not url or not title:
-            return
-        if not _filter_music_entry(title, dur):
-            return
-        key = _norm(title)
-        if key in seen:
-            return
-        seen.add(key)
-        priority = 0 if _uploader_matches(entry) else 1
-        candidates.append({"url": url, "title": title, "source": source,
-                            "duration": dur, "priority": priority})
-
-    # SoundCloud
-    for sq in sc_queries[:2]:
+    try:
         try:
-            opts = {"quiet": True, "no_warnings": True, "extract_flat": True}
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"scsearch10:{sq}", download=False)
-            for e in (info or {}).get("entries", []):
-                _add(e, "SoundCloud")
-        except Exception:
-            pass
+            from ddgs import DDGS as _DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS as _DDGS
 
-    # YouTube
-    yt_opts = {
-        "quiet": True, "no_warnings": True, "extract_flat": True,
-        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
-    }
-    for sq in yt_queries[:2]:
-        try:
-            with yt_dlp.YoutubeDL(yt_opts) as ydl:
-                info = ydl.extract_info(f"ytsearch10:{sq}", download=False)
-            for e in (info or {}).get("entries", []):
-                _add(e, "YouTube")
-        except Exception:
-            pass
+        ddgs = _DDGS()
+        results = list(ddgs.text(text, max_results=6))
+        if not results:
+            return None, ""
 
-    # Rutube
-    for sq in rt_queries[:1]:
-        try:
-            for e in _search_rutube(sq, count=5):
-                _add(e, "Rutube")
-        except Exception:
-            pass
-
-    # Sort: priority 0 (by the artist) first, then others
-    candidates.sort(key=lambda c: c.get("priority", 1))
-    return candidates
-
-
-def download_music_from_candidate(candidate: dict) -> tuple[bytes, str, str]:
-    """Download a specific candidate track. Returns (audio_bytes, title, artist)."""
-    url = candidate["url"]
-    source = candidate.get("source", "")
-    title_hint = candidate.get("title", "")
-
-    if source == "YouTube":
-        for client in ["tv_embedded", "mweb"]:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                extra = {"extractor_args": {"youtube": {"player_client": [client]}}}
-                if _YT_COOKIE_FILE:
-                    extra["cookiefile"] = _YT_COOKIE_FILE
-                opts = {**_audio_opts(tmpdir), **extra}
-                try:
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                    return _read_audio_result(tmpdir, info, title_hint)
-                except Exception as e:
-                    err = str(e).lower()
-                    if any(k in err for k in _YT_BOT_ERRORS + ("not available", "drm")):
-                        continue
-                    raise
-        raise RuntimeError(f"YouTube: не удалось скачать трек «{title_hint}»")
-
-    # SoundCloud, Rutube, or generic
-    with tempfile.TemporaryDirectory() as tmpdir:
-        opts = _audio_opts(tmpdir)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-        return _read_audio_result(tmpdir, info, title_hint)
-
-
-def search_and_download_first_music(query: str) -> tuple[tuple[bytes, str, str], list[dict], int]:
-    """
-    Search candidates and download the first successful one.
-    Returns (result, all_candidates, used_index).
-    """
-    candidates = search_music_candidates(query)
-    if not candidates:
-        raise RuntimeError(
-            f"Не удалось найти «{query}».\n"
-            "Попробуй другой запрос или отправь прямую ссылку на трек."
+        snippets = "\n\n".join(
+            f"[{r.get('title', '')}]\n{r.get('body', '')}"
+            for r in results[:5]
         )
-    last_err = None
-    for i, cand in enumerate(candidates):
-        try:
-            result = download_music_from_candidate(cand)
-            return result, candidates, i
-        except Exception as e:
-            last_err = e
-            continue
+
+        resp = groq_client.chat.completions.create(
+            model="moonshotai/kimi-k2-instruct-0905",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise fact-checker and knowledge assistant. "
+                        "Use ONLY the provided search snippets to compose a truthful, well-structured answer. "
+                        "Never hallucinate — if the snippets don't contain enough info, say so briefly.\n\n"
+                        "Formatting (Telegram Markdown — use * for bold, _ for italic):\n"
+                        "• Start with a bold title: *Topic Name*\n"
+                        "• Write a short intro paragraph\n"
+                        "• Use bullet points (•) for key facts or lists\n"
+                        "• Add sub-sections with *bold headers* when the topic has distinct parts\n"
+                        "• Be concise but informative (200-400 words max)\n"
+                        "• Respond in the SAME language as the user's question\n\n"
+                        "At the very end, on a new line, write exactly:\n"
+                        "IMAGE_QUERY: <short English image search query for this topic, or NONE if no image is useful>\n"
+                        "Use NONE for: abstract concepts, math, opinions, programming.\n"
+                        "Use an image query for: people, places, animals, science, technology, historical events, objects."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Question: {text}\n\nSearch results:\n{snippets}",
+                },
+            ],
+            max_tokens=1500,
+            temperature=0.1,
+        )
+
+        full = resp.choices[0].message.content.strip()
+
+        # Extract IMAGE_QUERY line
+        image_query = ""
+        img_match = re.search(r'^IMAGE_QUERY:\s*(.+)$', full, re.MULTILINE)
+        if img_match:
+            val = img_match.group(1).strip()
+            image_query = "" if val.upper() == "NONE" else val
+            full = full[:img_match.start()].strip()
+
+        return full, image_query
+
+    except Exception as e:
+        print(f"[search_web_info error] {e}", flush=True)
+        return None, ""
+
+
+def search_video_yt(query: str) -> tuple[bytes, str]:
+    """Search YouTube for the query and download the first result video."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        last_err = None
+        for client in _YT_CLIENTS:
+            opts = _base_opts(tmpdir, {
+                "format": "best[ext=mp4][filesize<50M]/best[ext=mp4]/best[filesize<50M]/best",
+                "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+                "extractor_args": {"youtube": {"player_client": [client]}},
+                "noplaylist": True,
+            })
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+                if info and "entries" in info:
+                    info = info["entries"][0]
+                filepath = _find_file(tmpdir)
+                size = os.path.getsize(filepath)
+                if size > MAX_FILE_SIZE:
+                    raise ValueError(
+                        f"Видео слишком большое ({size // (1024*1024)} МБ). Лимит — 50 МБ."
+                    )
+                with open(filepath, "rb") as f:
+                    return f.read(), info.get("title", query) if isinstance(info, dict) else query
+            except yt_dlp.utils.DownloadError as e:
+                last_err = e
+                if _is_bot_block(e):
+                    continue
+                raise RuntimeError(str(e)[:300]) from e
     raise RuntimeError(
-        f"Не удалось скачать музыку по запросу «{query}».\n"
-        f"Последняя ошибка: {last_err}"
-    )
-
-
-def _next_unsent_entry(state: dict) -> dict | None:
-    """Return the first entry from state['entries'] not in state['sent_ids'], or None."""
-    sent = state.get("sent_ids", set())
-    for entry in state.get("entries", []):
-        if entry["id"] not in sent:
-            return entry
-    return None
+        f"Не удалось найти видео «{query}». Попробуй другой запрос."
+    ) from last_err
 
 
 def _download_raw(url: str) -> bytes:
@@ -1038,115 +472,6 @@ def _download_raw(url: str) -> bytes:
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read()
 
-
-# ===== IMAGE SEARCH =====
-
-import threading as _threading
-_img_lock = _threading.Lock()
-_img_last_time: float = 0.0
-
-
-def _bing_images(query: str, max_results: int = 5, safe: bool = True) -> list[dict]:
-    """Scrape Bing image search (no API key needed)."""
-    import urllib.parse
-    q = urllib.parse.quote(query)
-    safesearch = "Off" if not safe else "Moderate"
-    url = (
-        f"https://www.bing.com/images/async?q={q}"
-        f"&count={max_results * 6}&safeSearch={safesearch}"
-        f"&FORM=HDRSC2"
-    )
-    req = urllib.request.Request(url, headers={
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.bing.com/",
-    })
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        html = resp.read().decode("utf-8", errors="replace")
-
-    urls = re.findall(r'murl&quot;:&quot;(https?://[^&"<]+?)&quot;', html)
-    results = []
-    seen = set()
-    for img_url in urls:
-        if img_url and img_url not in seen:
-            seen.add(img_url)
-            results.append({"url": img_url, "title": query})
-        if len(results) >= max_results:
-            break
-    return results
-
-
-def search_images(query: str, max_results: int = 5, safe: bool = True) -> list[dict]:
-    """Search images via Bing.
-    Thread-safe with rate limiting."""
-    import time
-    global _img_last_time
-
-    with _img_lock:
-        elapsed = time.time() - _img_last_time
-        if elapsed < 3.0:
-            time.sleep(3.0 - elapsed)
-        _img_last_time = time.time()
-
-        for attempt in range(2):
-            try:
-                results = _bing_images(query, max_results, safe)
-                if results:
-                    return results
-            except Exception:
-                if attempt == 0:
-                    time.sleep(2)
-
-        return []
-
-
-def download_image(url: str, timeout: int = 10) -> bytes:
-    """Download image bytes from URL, reject if > 10 MB."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://www.google.com/",
-    }
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = resp.read(10 * 1024 * 1024 + 1)
-    if len(data) > 10 * 1024 * 1024:
-        raise ValueError("Image too large")
-    return data
-
-
-def extract_image_query(text: str) -> str:
-    """Strip trigger words and return the clean search query."""
-    text = text.strip()
-    # Try specific multi-word patterns first (order matters — longest first)
-    for pat in [
-        r'покажи\s+как\s+выглядит\s+',
-        r'покажи(?:те)?\s+мне\s+',
-        r'покажи(?:те)?\s+',
-        r'хочу\s+(?:увидеть|посмотреть)\s+(?:фото|картинк\w*|изображени\w*\s+)?',
-        r'пришли\s+(?:мне\s+)?(?:фото|картинк\w+|фотк\w+|изображени\w+|фоточк\w+)\s+',
-        r'отправь\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+',
-        r'кинь\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+',
-        r'скинь\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+',
-        r'дай\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+',
-        r'найди\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+|фотографи\w+)\s+',
-        r'как\s+выглядят?\s+',
-        r'(?:фото|картинк[уи]|картинки|изображени[ея]|фотк[уи]|фоточк[уи])\s+',
-        # Fallback: strip bare trigger verb even without photo word
-        r'^\s*(?:пришли|найди|дай|кинь|скинь|отправь)\s+(?:мне\s+)?',
-    ]:
-        new_text = re.sub(pat, '', text, flags=re.IGNORECASE).strip()
-        if new_text and new_text != text:
-            text = new_text
-            break
-    return text
-
-
-# ===== FONTS =====
 
 def _github_font_listing(slug: str) -> list | None:
     """Return list of file dicts from google/fonts GitHub repo for the given slug."""
@@ -1604,6 +929,17 @@ def download_all_fonts(font_name: str) -> tuple[str, bytes]:
     )
 
 
+# ===== BACKGROUND REMOVAL =====
+
+def remove_background(image_bytes: bytes) -> bytes:
+    input_image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    output_image = rembg_remove(input_image)
+    buf = io.BytesIO()
+    output_image.save(buf, format="PNG")
+    buf.seek(0)
+    return buf.read()
+
+
 # ===== PHOTO UPSCALE x3 =====
 
 UPSCALE_RE = re.compile(r'улучши\s*фото', re.IGNORECASE)
@@ -1761,26 +1097,6 @@ def compress_image_to_size(image_bytes: bytes, target_bytes: int) -> bytes:
     return best
 
 
-def compress_zip_images(zip_bytes: bytes, target_bytes: int):
-    """Compress images in a zip that exceed target_bytes. Returns (new_zip_bytes, total_images, compressed_count)."""
-    _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    in_zip = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
-    out_buf = io.BytesIO()
-    total = 0
-    compressed_count = 0
-    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_STORED) as out_zip:
-        for name in in_zip.namelist():
-            data = in_zip.read(name)
-            ext = os.path.splitext(name)[1].lower()
-            if ext in _IMAGE_EXTS:
-                total += 1
-                if len(data) > target_bytes:
-                    data = compress_image_to_size(data, target_bytes)
-                    compressed_count += 1
-            out_zip.writestr(name, data)
-    return out_buf.getvalue(), total, compressed_count
-
-
 # Buffer for album (media group) photos
 _album_buffer: dict = {}
 
@@ -1851,30 +1167,16 @@ async def _process_album(media_group_id: str, context):
 
 
 async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle videos sent by user — broadcast if owner in broadcast mode, otherwise inform."""
-    user_id = update.message.from_user.id
-    _register_user(user_id)
-    if user_id == OWNER_ID and user_id in broadcast_pending:
-        broadcast_pending.discard(user_id)
-        await _do_broadcast(update, context)
-        return
+    """Handle videos sent by user — inform them it's not supported."""
     await update.message.reply_text(
-        "📥 Для скачивания видео — отправь ссылку на VK.\n"
-        "Например: https://vk.com/video..."
+        "📥 Для скачивания видео — отправь ссылку на YouTube или Instagram.\n"
+        "Например: https://youtube.com/watch?v=..."
     )
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user_id = message.from_user.id
-    _register_user(user_id)
-
-    # Broadcast mode: owner sends photo to all users
-    if user_id == OWNER_ID and user_id in broadcast_pending:
-        broadcast_pending.discard(user_id)
-        await _do_broadcast(update, context)
-        return
-
     photo = message.photo[-1]
     caption = (message.caption or "").strip()
     target_bytes = parse_target_size(caption)
@@ -1902,8 +1204,8 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 size_mb = len(result_bytes) / (1024 * 1024)
                 filename = "upscaled_3x.jpg"
                 fmt = "JPEG"
-            await _safe_send_doc(
-                message, result_bytes,
+            await message.reply_document(
+                document=io.BytesIO(result_bytes),
                 filename=filename,
                 caption=(
                     f"✅ Готово! Увеличено в 3x ({fmt})\n"
@@ -1923,7 +1225,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dl = io.BytesIO()
             await file.download_to_memory(dl)
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(_EXECUTOR, analyze_text_percentage, dl.getvalue())
+            result = await loop.run_in_executor(None, analyze_text_percentage, dl.getvalue())
             await message.reply_text(f"📊 {result}")
             await msg.delete()
         except Exception as e:
@@ -1974,13 +1276,22 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"⚠ Ошибка: {e}")
 
     else:
-        await message.reply_text(
-            "📷 Фото получено!\n\n"
-            "Что я умею с фото:\n"
-            "• Подпиши «улучши фото» — увеличу в 3x\n"
-            "• Подпиши «процент текста» — определю долю текста\n"
-            "• Для сжатия — отправь ZIP-архив с картинками и подпиши «до 512кб»"
-        )
+        # Single photo, no size → remove background
+        msg = await message.reply_text("✂️ Удаляю фон...")
+        try:
+            file = await context.bot.get_file(photo.file_id)
+            dl = io.BytesIO()
+            await file.download_to_memory(dl)
+            loop = asyncio.get_running_loop()
+            result_bytes = await loop.run_in_executor(None, remove_background, dl.getvalue())
+            await message.reply_document(
+                document=io.BytesIO(result_bytes),
+                filename="no_background.png",
+                caption="✅ Фон удалён",
+            )
+            await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"⚠ Ошибка: {e}")
 
 
 # ===== VIDEO DOWNLOAD =====
@@ -2001,57 +1312,395 @@ def _find_file(tmpdir, preferred_ext=None):
     return files[0]
 
 
+_YT_CLIENTS = ["android", "ios", "tv_embedded", "web"]
+
+
 def _base_opts(tmpdir, extra=None):
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 10,
-        "retries": 1,
-        "fragment_retries": 1,
-        "extractor_retries": 1,
     }
     if extra:
         opts.update(extra)
+    if YOUTUBE_COOKIES:
+        cookies_path = os.path.join(tmpdir, "cookies.txt")
+        with open(cookies_path, "w") as f:
+            f.write(YOUTUBE_COOKIES)
+        opts["cookiefile"] = cookies_path
     return opts
+
+
+def _is_bot_block(exc):
+    msg = str(exc).lower()
+    return "sign in" in msg or "bot" in msg or "confirm your age" in msg or "429" in msg
 
 
 def download_video(url):
     with tempfile.TemporaryDirectory() as tmpdir:
-        opts = _base_opts(tmpdir, {
-            "format": "best[ext=mp4][filesize<50M]/best[ext=mp4]/best[filesize<50M]/best",
-            "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+        last_err = None
+        for client in _YT_CLIENTS:
+            opts = _base_opts(tmpdir, {
+                "format": "best[ext=mp4][filesize<50M]/best[ext=mp4]/best[filesize<50M]/best",
+                "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+                "extractor_args": {"youtube": {"player_client": [client]}},
+            })
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    filepath = ydl.prepare_filename(info)
+                    if not os.path.exists(filepath):
+                        filepath = _find_file(tmpdir)
+                    size = os.path.getsize(filepath)
+                    if size > MAX_FILE_SIZE:
+                        raise ValueError(
+                            f"Видео слишком большое ({size // (1024 * 1024)} МБ). Лимит Telegram — 50 МБ."
+                        )
+                    with open(filepath, "rb") as f:
+                        return f.read(), info.get("title", "Video")
+            except yt_dlp.utils.DownloadError as e:
+                last_err = e
+                if _is_bot_block(e):
+                    continue  # try next client
+                raise RuntimeError(str(e)[:300]) from e
+        raise RuntimeError(
+            "YouTube заблокировал скачивание на всех клиентах.\n"
+            "Добавь куки браузера через переменную YOUTUBE_COOKIES."
+        ) from last_err
+
+
+# ===== YOUTUBE SHORTS SEARCH =====
+
+_SHORTS_FORMAT = (
+    "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
+    "/bestvideo[ext=mp4]+bestaudio"
+    "/bestvideo+bestaudio"
+    "/best[ext=mp4]"
+    "/best"
+)
+
+
+def _yt_search_entries(query: str, count: int = 20):
+    """Return flat list of YouTube search entries without downloading."""
+    search_url = f"ytsearch{count}:{query}"
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+    }
+    # pass cookies if configured
+    if YOUTUBE_COOKIES:
+        import tempfile as _tf
+        _tmp = _tf.mktemp(suffix=".txt")
+        with open(_tmp, "w") as _f:
+            _f.write(YOUTUBE_COOKIES)
+        opts["cookiefile"] = _tmp
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        results = ydl.extract_info(search_url, download=False)
+    if not results or "entries" not in results:
+        return []
+    return [e for e in results["entries"] if e and e.get("id")]
+
+
+def _yt_download_one(video_id: str, tmpdir: str, client: str) -> tuple[bytes, str]:
+    """Download a single YouTube video by ID, return (bytes, title)."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    opts = _base_opts(tmpdir, {
+        "format": _SHORTS_FORMAT,
+        "outtmpl": os.path.join(tmpdir, f"{video_id}.%(ext)s"),
+        "merge_output_format": "mp4",
+        "extractor_args": {"youtube": {"player_client": [client]}},
+        "quiet": True,
+        "no_warnings": True,
+    })
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    filepath = _find_file(tmpdir, preferred_ext=".mp4")
+    size = os.path.getsize(filepath)
+    if size > MAX_FILE_SIZE:
+        raise ValueError(f"Видео слишком большое ({size // (1024*1024)} МБ). Лимит — 50 МБ.")
+    with open(filepath, "rb") as f:
+        return f.read(), info.get("title", video_id)
+
+
+_AUTH_ERRORS = ("sign in", "confirm your age", "inappropriate for some users", "age-restricted")
+
+
+# ===== CANDIDATE SEARCH HELPERS =====
+
+def _search_shorts_candidates(query: str) -> list:
+    """Return sorted list of YouTube Shorts candidate entry dicts."""
+    all_entries: list = []
+    for search_q in [f"{query} #shorts", f"{query} shorts"]:
+        found = _yt_search_entries(search_q, count=20)
+        for e in found:
+            if e.get("id") and e["id"] not in {x["id"] for x in all_entries}:
+                all_entries.append(e)
+        if len(all_entries) >= 20:
+            break
+    def _sort_key(e):
+        d = e.get("duration")
+        if d is None:
+            return 1
+        return 0 if d <= 60 else 2
+    return sorted(all_entries, key=_sort_key)
+
+
+def _dl_short_by_entry(entry: dict) -> tuple[bytes, str] | None:
+    """Download a single Shorts entry, return (bytes, title) or None on failure."""
+    vid_id = entry.get("id")
+    if not vid_id:
+        return None
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for client in _YT_CLIENTS:
+            try:
+                data, title = _yt_download_one(vid_id, tmpdir, client)
+                return data, title
+            except yt_dlp.utils.DownloadError as e:
+                if any(k in str(e).lower() for k in _AUTH_ERRORS):
+                    break
+            except Exception:
+                continue
+    return None
+
+
+def _search_tiktok_candidates(query: str) -> list:
+    """Return list of TikTok video dicts from tikwm API."""
+    encoded = urllib.parse.quote(query)
+    api_url = (
+        f"https://www.tikwm.com/api/feed/search"
+        f"?keywords={encoded}&count=20&cursor=0&web=1&hd=1"
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.tikwm.com/",
+    }
+    try:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        return (data.get("data") or {}).get("videos") or []
+    except Exception:
+        return []
+
+
+def _dl_tiktok_by_video(video: dict) -> tuple[bytes, str] | None:
+    """Download a single TikTok video dict, return (bytes, caption) or None."""
+    def _make_url(raw: str) -> str:
+        if not raw:
+            return ""
+        if raw.startswith("http"):
+            return raw
+        return "https://www.tikwm.com" + (raw if raw.startswith("/") else "/" + raw)
+
+    play_url = _make_url(video.get("play") or video.get("wmplay") or "")
+    if not play_url:
+        return None
+    title = (video.get("title") or video.get("content_desc") or video.get("desc") or "").strip()
+    author = (video.get("author") or {}).get("nickname") or ""
+    caption = f"🎵 {title[:200]}" + (f"\n👤 @{author}" if author else "")
+    try:
+        req = urllib.request.Request(play_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.tikwm.com/",
         })
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filepath = ydl.prepare_filename(info)
-                if not os.path.exists(filepath):
-                    filepath = _find_file(tmpdir)
+        with urllib.request.urlopen(req, timeout=40) as r:
+            video_bytes = r.read()
+        if 50_000 <= len(video_bytes) <= MAX_FILE_SIZE:
+            return video_bytes, caption
+    except Exception:
+        pass
+    return None
+
+
+def _search_yt_video_candidates(query: str, count: int = 8) -> list:
+    """Return list of YouTube video entry dicts (flat, no download)."""
+    return _yt_search_entries(query, count=count)
+
+
+def _dl_yt_video_by_entry(entry: dict) -> tuple[bytes, str] | None:
+    """Download a YouTube video entry, return (bytes, title) or None."""
+    vid_id = entry.get("id")
+    if not vid_id:
+        return None
+    url = f"https://www.youtube.com/watch?v={vid_id}"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        last_err = None
+        for client in _YT_CLIENTS:
+            opts = _base_opts(tmpdir, {
+                "format": "best[ext=mp4][filesize<50M]/best[ext=mp4]/best[filesize<50M]/best",
+                "outtmpl": os.path.join(tmpdir, f"{vid_id}.%(ext)s"),
+                "extractor_args": {"youtube": {"player_client": [client]}},
+            })
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                filepath = _find_file(tmpdir)
                 size = os.path.getsize(filepath)
                 if size > MAX_FILE_SIZE:
-                    raise ValueError(
-                        f"Видео слишком большое ({size // (1024 * 1024)} МБ). Лимит Telegram — 50 МБ."
-                    )
+                    return None
                 with open(filepath, "rb") as f:
-                    return f.read(), info.get("title", "Video")
-        except yt_dlp.utils.DownloadError as e:
-            raise RuntimeError(str(e)[:300]) from e
+                    data = f.read()
+                title = info.get("title", vid_id) if isinstance(info, dict) else vid_id
+                return data, title
+            except yt_dlp.utils.DownloadError as e:
+                last_err = e
+                if _is_bot_block(e):
+                    continue
+                break
+            except Exception as e:
+                last_err = e
+    return None
+
+
+def _search_music_candidates(query: str, count: int = 8) -> list:
+    """Return list of YouTube entry dicts suitable for music download."""
+    return _yt_search_entries(f"{query} audio", count=count)
+
+
+def _dl_music_by_entry(entry: dict) -> tuple[bytes, str, str] | None:
+    """Download music for a YouTube entry, return (bytes, title, artist) or None."""
+    vid_id = entry.get("id")
+    if not vid_id:
+        return None
+    url = f"https://www.youtube.com/watch?v={vid_id}"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for client in _YT_CLIENTS:
+            opts = _audio_opts(tmpdir, {
+                "extractor_args": {"youtube": {"player_client": [client]}},
+            })
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                return _read_audio_result(tmpdir, info, url)
+            except Exception:
+                continue
+    return None
+
+
+def search_and_download_shorts(query: str) -> tuple[bytes, str]:
+    """Search YouTube Shorts by keyword and download the first working result."""
+    # Try two search queries: with #shorts hashtag and without
+    all_entries: list = []
+    for search_q in [f"{query} #shorts", f"{query} shorts"]:
+        found = _yt_search_entries(search_q, count=20)
+        for e in found:
+            if e.get("id") and e["id"] not in {x["id"] for x in all_entries}:
+                all_entries.append(e)
+        if len(all_entries) >= 20:
+            break
+
+    if not all_entries:
+        raise RuntimeError(
+            f"YouTube не вернул результатов по запросу «{query}».\n"
+            "Попробуй другое название."
+        )
+
+    # Sort: prefer true Shorts (duration ≤ 60 s); put unknowns (None) in middle
+    def _sort_key(e):
+        d = e.get("duration")
+        if d is None:
+            return 1          # unknown — might be a short
+        return 0 if d <= 60 else 2
+
+    candidates = sorted(all_entries, key=_sort_key)[:10]
+
+    last_err: Exception | None = None
+    for entry in candidates:
+        vid_id = entry["id"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skip_video = False
+            for client in _YT_CLIENTS:
+                if skip_video:
+                    break
+                try:
+                    data, title = _yt_download_one(vid_id, tmpdir, client)
+                    return data, title
+                except yt_dlp.utils.DownloadError as e:
+                    last_err = e
+                    err_s = str(e).lower()
+                    if any(k in err_s for k in _AUTH_ERRORS):
+                        skip_video = True   # age/auth — no client will fix it
+                    # else: try next client (format/network issues may be client-specific)
+                except Exception as e:
+                    last_err = e
+                    # unexpected error — try next client
+
+    raise RuntimeError(
+        f"YouTube не отдаёт шортс по запросу «{query}».\n"
+        "Попробуй другое название или добавь куки через YOUTUBE_COOKIES."
+    ) from last_err
+
+
+# ===== TIKTOK SEARCH =====
+
+def search_and_download_tiktok(query: str) -> tuple[bytes, str]:
+    """Search TikTok videos by keyword via tikwm.com API and download best result."""
+    import urllib.parse
+    encoded = urllib.parse.quote(query)
+    api_url = (
+        f"https://www.tikwm.com/api/feed/search"
+        f"?keywords={encoded}&count=10&cursor=0&web=1&hd=1"
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.tikwm.com/",
+    }
+    req = urllib.request.Request(api_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        raise RuntimeError(f"Ошибка поиска TikTok: {e}") from e
+
+    videos = (data.get("data") or {}).get("videos") or []
+    if not videos:
+        raise RuntimeError(f"Ничего не найдено в TikTok по запросу «{query}».")
+
+    def _make_full_url(raw: str) -> str:
+        if not raw:
+            return ""
+        if raw.startswith("http"):
+            return raw
+        if raw.startswith("/"):
+            return "https://www.tikwm.com" + raw
+        return "https://www.tikwm.com/" + raw
+
+    last_err: Exception | None = None
+    for video in videos[:8]:
+        play_url = _make_full_url(video.get("play") or video.get("wmplay") or "")
+        title = (video.get("title") or video.get("content_desc") or video.get("desc") or query).strip()
+        author = (video.get("author") or {}).get("nickname") or ""
+        caption = f"🎵 {title[:200]}" + (f"\n👤 @{author}" if author else "")
+        if not play_url:
+            continue
+        try:
+            dl_req = urllib.request.Request(play_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://www.tikwm.com/",
+            })
+            with urllib.request.urlopen(dl_req, timeout=40) as r:
+                video_bytes = r.read()
+            if len(video_bytes) < 50_000:
+                continue
+            if len(video_bytes) > MAX_FILE_SIZE:
+                last_err = ValueError("Видео слишком большое. Лимит — 50 МБ.")
+                continue
+            return video_bytes, caption
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(
+        f"Не удалось скачать видео из TikTok по запросу «{query}».\n"
+        "Попробуй другое название."
+    ) from last_err
 
 
 # ===== MUSIC DOWNLOAD =====
-
-def _ffmpeg_executable() -> str:
-    import shutil
-    ffmpeg_path = shutil.which("ffmpeg")
-    if ffmpeg_path:
-        return ffmpeg_path
-    try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        return "ffmpeg"
-
 
 def _audio_opts(tmpdir, extra=None):
     opts = _base_opts(tmpdir, {
@@ -2063,9 +1712,6 @@ def _audio_opts(tmpdir, extra=None):
             "preferredquality": "192",
         }],
     })
-    ffmpeg_path = _ffmpeg_executable()
-    if ffmpeg_path:
-        opts["ffmpeg_location"] = ffmpeg_path
     if extra:
         opts.update(extra)
     return opts
@@ -2074,13 +1720,7 @@ def _audio_opts(tmpdir, extra=None):
 def _read_audio_result(tmpdir, info, fallback_title: str):
     import subprocess
     if isinstance(info, dict) and "entries" in info:
-        entries = [e for e in (info.get("entries") or []) if e]
-        if not entries:
-            raise RuntimeError(
-                f"Ничего не нашёл по запросу «{fallback_title}».\n"
-                "Попробуй написать точнее: исполнитель + название трека."
-            )
-        info = entries[0]
+        info = info["entries"][0]
     filepath = _find_file(tmpdir, preferred_ext=".mp3")
     size = os.path.getsize(filepath)
     # If file is too large, re-encode at lower bitrate to fit within limit
@@ -2088,7 +1728,7 @@ def _read_audio_result(tmpdir, info, fallback_title: str):
         low_path = filepath + "_low.mp3"
         try:
             subprocess.run(
-                [_ffmpeg_executable(), "-y", "-i", filepath, "-b:a", "96k", low_path],
+                ["ffmpeg", "-y", "-i", filepath, "-b:a", "96k", low_path],
                 capture_output=True, check=True,
             )
             low_size = os.path.getsize(low_path)
@@ -2106,142 +1746,81 @@ def _read_audio_result(tmpdir, info, fallback_title: str):
     return data, title, artist
 
 
-def _best_match_score(title: str, query: str) -> float:
-    """
-    Score how well a result title matches the query.
-    Higher = better match. Used to pick the best result from multi-result searches.
-    """
-    title_l = title.lower()
-    query_l = query.lower()
-    query_words = set(query_l.split())
-    title_words = set(title_l.split())
-    # Word overlap ratio
-    overlap = len(query_words & title_words) / max(len(query_words), 1)
-    # Bonus if query is a substring of title or vice versa
-    exact_bonus = 0.3 if query_l in title_l else (0.1 if title_l in query_l else 0)
-    return overlap + exact_bonus
-
-
-def _sc_search_best(query: str, tmpdir: str, count: int = 5):
-    """
-    Search SoundCloud for `count` results, pick the best matching one, and download it.
-    Returns (info_dict, downloaded_filepath_prefix) or raises.
-    """
-    flat_opts = {"quiet": True, "no_warnings": True, "extract_flat": True}
-    with yt_dlp.YoutubeDL(flat_opts) as ydl:
-        flat_info = ydl.extract_info(f"scsearch{count}:{query}", download=False)
-    entries = [e for e in (flat_info or {}).get("entries", []) if e]
-    if not entries:
-        raise RuntimeError("Нет результатов на SoundCloud")
-    # Score and sort — pick best match
-    scored = sorted(entries, key=lambda e: _best_match_score(e.get("title", ""), query), reverse=True)
-    best = scored[0]
-    url = best.get("url") or best.get("webpage_url", "")
-    if not url:
-        raise RuntimeError("Нет URL у лучшего результата")
-    # Download the chosen track
-    with yt_dlp.YoutubeDL(_audio_opts(tmpdir)) as ydl:
-        info = ydl.extract_info(url, download=True)
-    return info
-
-
-def _yt_extractor_args():
-    """Return yt-dlp opts that bypass YouTube bot-detection. Uses cookies if available."""
-    opts = {"extractor_args": {"youtube": {"player_client": ["tv_embedded"]}}}
-    if _YT_COOKIE_FILE:
-        opts["cookiefile"] = _YT_COOKIE_FILE
-    return opts
-
-
-def _try_youtube_music(query: str):
-    """Try YouTube audio download, returns (bytes, title, artist) or raises."""
-    flat_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        **_yt_extractor_args(),
-    }
-    with yt_dlp.YoutubeDL(flat_opts) as ydl:
-        flat_info = ydl.extract_info(f"ytsearch5:{query}", download=False)
-    entries = [e for e in (flat_info or {}).get("entries", []) if e]
-    if not entries:
-        raise RuntimeError("Нет результатов на YouTube")
-    scored = sorted(entries, key=lambda e: _best_match_score(e.get("title", ""), query), reverse=True)
-    best = scored[0]
-    url = best.get("url") or best.get("webpage_url", "")
-    if not url:
-        raise RuntimeError("Нет URL у лучшего результата")
-    yt_audio_clients = ["tv_embedded", "mweb", "ios"]
-    for client in yt_audio_clients:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            extra_args = {"extractor_args": {"youtube": {"player_client": [client]}}}
-            if _YT_COOKIE_FILE:
-                extra_args["cookiefile"] = _YT_COOKIE_FILE
-            opts = {**_audio_opts(tmpdir), **extra_args}
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                return _read_audio_result(tmpdir, info, query)
-            except Exception as e:
-                err = str(e).lower()
-                if any(k in err for k in _YT_BOT_ERRORS + ("not available", "drm")):
-                    continue
-                raise
-    raise RuntimeError(f"YouTube: не удалось скачать аудио по запросу «{query}»")
-
-
-def _try_soundcloud(query: str):
-    """Try SoundCloud download, returns (bytes, title, artist) or raises."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        info = _sc_search_best(query, tmpdir, count=5)
-        return _read_audio_result(tmpdir, info, query)
-
-
-def _try_rutube(query: str):
-    """Try Rutube download, returns (bytes, title, artist) or raises."""
-    for q in [query, f"{query} official audio", f"{query} аудио"]:
-        entries = _search_rutube(q, count=5)
-        for e in entries:
-            dur = e.get("duration") or 0
-            if dur and dur > 900:
-                continue
-            with tempfile.TemporaryDirectory() as tmpdir:
-                try:
-                    opts = _audio_opts(tmpdir)
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(e["url"], download=True)
-                    return _read_audio_result(tmpdir, info, query)
-                except Exception:
-                    continue
-    raise RuntimeError(f"Rutube: ничего не нашёл по «{query}»")
+def _find_short_yt_url(query: str, max_duration: int = 600) -> str | None:
+    """Search YouTube for query, return URL of the first result under max_duration seconds."""
+    try:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "noplaylist": False,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch10:{query}", download=False)
+        if not info or "entries" not in info:
+            return None
+        for entry in (info.get("entries") or []):
+            duration = entry.get("duration") or 0
+            vid_id = entry.get("id", "")
+            if vid_id and 20 < duration < max_duration:
+                return f"https://www.youtube.com/watch?v={vid_id}"
+    except Exception:
+        pass
+    return None
 
 
 def download_music(query: str):
-    """
-    Concurrently search SoundCloud + Rutube + YouTube, return the first success.
-    Falls back to the slower sources if the first attempt fails.
-    """
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        fs = {
-            pool.submit(_try_soundcloud, query): "SoundCloud",
-            pool.submit(_try_rutube, query): "Rutube",
-            pool.submit(_try_youtube_music, query): "YouTube",
-        }
-        errors = []
-        for future in concurrent.futures.as_completed(fs, timeout=90):
-            try:
-                result = future.result()
-                # Cancel the other task
-                for f in fs:
-                    f.cancel()
-                return result
-            except Exception as e:
-                errors.append(str(e))
-                continue
+    """Search and download audio from multiple sources: YouTube → SoundCloud → Deezer."""
+    last_err = None
+
+    # 1a. YouTube — try to find an individual track (< 10 min) via metadata search first
+    short_url = _find_short_yt_url(query, max_duration=600)
+    yt_targets = []
+    if short_url:
+        yt_targets.append(short_url)        # specific short video URL
+    yt_targets.append(f"ytsearch1:{query}")  # fallback: top result regardless of length
+
+    for yt_target in yt_targets:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for client in _YT_CLIENTS:
+                opts = _audio_opts(tmpdir, {
+                    "extractor_args": {"youtube": {"player_client": [client]}},
+                })
+                try:
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(yt_target, download=True)
+                    return _read_audio_result(tmpdir, info, query)
+                except yt_dlp.utils.DownloadError as e:
+                    last_err = e
+                    if _is_bot_block(e):
+                        continue   # try next client
+                    break          # non-bot-block error: stop rotating clients, try next target
+                except ValueError:
+                    # File too large even after re-encoding — try next target
+                    break
+            # Always continue to the next target (short URL → ytsearch1:)
+
+    # 2. SoundCloud
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            with yt_dlp.YoutubeDL(_audio_opts(tmpdir)) as ydl:
+                info = ydl.extract_info(f"scsearch1:{query}", download=True)
+            return _read_audio_result(tmpdir, info, query)
+        except Exception as e:
+            last_err = e
+
+    # 3. Deezer
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            with yt_dlp.YoutubeDL(_audio_opts(tmpdir)) as ydl:
+                info = ydl.extract_info(f"dzsearch1:{query}", download=True)
+            return _read_audio_result(tmpdir, info, query)
+        except Exception as e:
+            last_err = e
 
     raise RuntimeError(
-        f"Не удалось найти «{query}».\n"
-        "Попробуй другой запрос или отправь прямую ссылку на трек."
+        f"Не удалось найти «{query}» ни на YouTube, SoundCloud, ни на Deezer.\n"
+        f"Попробуй другой запрос или отправь прямую ссылку на трек."
     )
 
 
@@ -2257,8 +1836,223 @@ def download_audio_url(url: str):
             raise RuntimeError(str(e)[:400]) from e
 
 
+# ===== TELEGRAM PROXY =====
+
+_PROXY_SOURCES = [
+    "https://t.me/s/ProxyMTProto",
+    "https://t.me/s/MTProxyT",
+    "https://t.me/s/freeproxy_mtproto",
+    "https://t.me/s/mtproto_proxy_list",
+]
+
+_PROXY_PATTERN = re.compile(r'https://t\.me/(?:proxy|socks)\?[^\s"\'<>]+')
+_PROXY_PARAM_RE = re.compile(r'server=([^&\s]+).*?port=(\d+)', re.DOTALL)
+
+
+def _check_proxy_port(proxy_url: str, timeout: float = 2.5) -> bool:
+    """Return True if the proxy server:port is reachable via TCP."""
+    m = _PROXY_PARAM_RE.search(proxy_url)
+    if not m:
+        return False
+    server, port = m.group(1), int(m.group(2))
+    try:
+        with socket.create_connection((server, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def fetch_telegram_proxies(max_results: int = 5, check_count: int = 40) -> list[str]:
+    """
+    Fetch MTProto/SOCKS5 proxy links from public Telegram channels,
+    verify TCP reachability, return up to max_results working links.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    raw_links: list[str] = []
+
+    def _scrape(url: str) -> list[str]:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                text = _html.unescape(_html.unescape(r.read().decode("utf-8", errors="ignore")))
+            return _PROXY_PATTERN.findall(text)
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=len(_PROXY_SOURCES)) as ex:
+        for links in ex.map(_scrape, _PROXY_SOURCES):
+            raw_links.extend(links)
+
+    # Deduplicate preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for link in raw_links:
+        if link not in seen:
+            seen.add(link)
+            unique.append(link)
+
+    candidates = unique[:check_count]
+    working: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futures = {ex.submit(_check_proxy_port, p): p for p in candidates}
+        for f in as_completed(futures):
+            if f.result():
+                working.append(futures[f])
+            if len(working) >= max_results:
+                break
+
+    return working[:max_results]
+
+
+# ===== MUSIC RECOGNITION (SHAZAM-LIKE) =====
+
+def convert_audio_to_mp3(audio_bytes: bytes) -> bytes:
+    """Convert audio (OGG/OGA/WAV/etc.) to MP3 via ffmpeg."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = os.path.join(tmpdir, "input.oga")
+        out_path = os.path.join(tmpdir, "output.mp3")
+        with open(in_path, "wb") as f:
+            f.write(audio_bytes)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", in_path, "-ar", "44100", "-ac", "2", "-b:a", "128k", out_path],
+            capture_output=True,
+            check=True,
+        )
+        with open(out_path, "rb") as f:
+            return f.read()
+
+
+def recognize_with_audd(mp3_bytes: bytes) -> dict | None:
+    """Recognize music via AudD free API (no key required)."""
+    boundary = "----WebKitFormBoundaryAudd"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="audio"; filename="audio.mp3"\r\n'
+        f"Content-Type: audio/mpeg\r\n\r\n"
+    ).encode() + mp3_bytes + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        "https://api.audd.io/",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "Mozilla/5.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+        if data.get("status") == "success" and data.get("result"):
+            r = data["result"]
+            return {"title": r.get("title", ""), "artist": r.get("artist", "")}
+    except Exception:
+        pass
+    return None
+
+
+async def recognize_with_shazam(mp3_bytes: bytes) -> dict | None:
+    """Recognize music via Shazam (shazamio unofficial client)."""
+    try:
+        from shazamio import Shazam
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(mp3_bytes)
+            tmp = f.name
+        try:
+            shazam = Shazam()
+            out = await shazam.recognize(tmp)
+            if out and out.get("matches"):
+                track = out.get("track", {})
+                title = track.get("title", "")
+                artist = track.get("subtitle", "")
+                if title:
+                    return {"title": title, "artist": artist}
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+async def recognize_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice/audio messages: recognise song via multiple services, then download it."""
+    message = update.message
+    voice = message.voice or message.audio
+    if voice is None:
+        return
+
+    msg = await message.reply_text("🎵 Распознаю музыку…")
+    loop = asyncio.get_running_loop()
+
+    try:
+        file = await context.bot.get_file(voice.file_id)
+        buf = io.BytesIO()
+        await file.download_to_memory(buf)
+        raw_bytes = buf.getvalue()
+
+        # Convert to MP3 (Telegram voice = OGG Opus)
+        try:
+            mp3_bytes = await loop.run_in_executor(None, convert_audio_to_mp3, raw_bytes)
+        except Exception:
+            mp3_bytes = raw_bytes
+
+        # 1. Shazam (primary)
+        result = await recognize_with_shazam(mp3_bytes)
+
+        # 2. AudD fallback
+        if not result:
+            await msg.edit_text("🔍 Shazam не смог, пробую AudD…")
+            result = await loop.run_in_executor(None, recognize_with_audd, mp3_bytes)
+
+        if not result:
+            await msg.edit_text(
+                "😔 Не удалось распознать.\n\n"
+                "*Советы:*\n"
+                "• Запись 10–30 секунд без шума\n"
+                "• Музыка должна быть чёткой\n"
+                "• При напевании — пой ровно, без слов, просто мелодию",
+                parse_mode="Markdown",
+            )
+            return
+
+        title = result["title"]
+        artist = result.get("artist", "")
+        search_query = f"{artist} - {title}".strip(" -") if artist else title
+
+        caption = f"✅ *{title}*"
+        if artist:
+            caption += f"\n👤 {artist}"
+
+        await msg.edit_text(caption + "\n\n🎵 Скачиваю…", parse_mode="Markdown")
+
+        try:
+            audio_out, dl_title, dl_artist = await loop.run_in_executor(
+                None, download_music, search_query
+            )
+            await message.reply_audio(
+                audio=io.BytesIO(audio_out),
+                filename=f"{search_query}.mp3",
+                title=title,
+                performer=artist or dl_artist,
+                caption=caption,
+                parse_mode="Markdown",
+            )
+            await msg.delete()
+        except Exception as e:
+            await msg.edit_text(
+                caption + f"\n\n⚠ Не удалось скачать файл: {e}",
+                parse_mode="Markdown",
+            )
+
+    except Exception as e:
+        await msg.edit_text(f"⚠ Ошибка: {e}")
+
+
 async def music_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
     query = " ".join(context.args).strip()
     if not query:
         await update.message.reply_text(
@@ -2267,24 +2061,35 @@ async def music_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    msg = await update.message.reply_text(f"🔍 Ищу: {query}…")
-    loop = asyncio.get_running_loop()
+    msg = await update.message.reply_text(f"🔍 Ищу: {query}...")
+
     try:
-        result, candidates, used_idx = await asyncio.wait_for(
-            loop.run_in_executor(_EXECUTOR, search_and_download_first_music, query),
-            timeout=150,
-        )
-        audio_bytes, title, artist = result
-        music_search_state[user_id] = {"candidates": candidates, "idx": used_idx, "query": query}
-        await msg.edit_text("📤 Загружаю файл…")
-        await _safe_send_audio(
-            update.message, audio_bytes,
-            filename=f"{title}.mp3", title=title, performer=artist,
-            reply_markup=_music_keyboard(),
+        loop = asyncio.get_running_loop()
+        user_id = update.message.from_user.id
+        candidates = await loop.run_in_executor(None, _search_music_candidates, query)
+        if candidates:
+            user_more_cache[user_id] = {"type": "music", "query": query, "entries": candidates, "index": 1}
+            result = await loop.run_in_executor(None, _dl_music_by_entry, candidates[0])
+            if result:
+                audio_bytes, title, artist = result
+                await update.message.reply_audio(
+                    audio=io.BytesIO(audio_bytes),
+                    filename=f"{title}.mp3",
+                    title=title,
+                    performer=artist,
+                    caption="💬 Напиши «еще» чтобы получить другой трек",
+                )
+                await msg.delete()
+                return
+        audio_bytes, title, artist = await loop.run_in_executor(None, download_music, query)
+        await msg.edit_text("📤 Загружаю файл...")
+        await update.message.reply_audio(
+            audio=io.BytesIO(audio_bytes),
+            filename=f"{title}.mp3",
+            title=title,
+            performer=artist,
         )
         await msg.delete()
-    except asyncio.TimeoutError:
-        await msg.edit_text("⏱ Превышено время ожидания. Попробуй ещё раз.")
     except Exception as e:
         await msg.edit_text(f"⚠ Ошибка: {e}")
 
@@ -2293,42 +2098,28 @@ async def music_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    _register_user(user_id)
     await update.message.reply_text(
-        "🤖 *Бот* — пиши что угодно.\n"
-        "\n"
-        "💬 *Общение*\n"
-        "• Любой вопрос — отвечу развёрнуто\n"
-        "• Поддерживаю контекст разговора\n"
-        "• /reset — очистить память\n"
-        "\n"
-        "🎬 *Видео*\n"
-        "• *«видео котики»* — скачаю с YouTube / Rutube / Dailymotion / Vimeo\n"
-        "• *«трейлер Интерстеллар»* — найду и пришлю файлом\n"
-        "• Ссылка VK (vk.com/video...) — скачаю видео\n"
-        "• Кнопка *▶️ Следующий* — попробую другой вариант\n"
-        "\n"
-        "🎵 *Музыка*\n"
-        "• *«музыка Imagine Dragons Believer»* — скачаю трек\n"
-        "• *«Пришли музыку из фильма Интерстеллар»* — найду саундтрек\n"
-        "• Ссылка SoundCloud / VK аудио / Deezer — скачаю MP3\n"
-        "• Кнопка *🔄 Ещё* — попробую другой вариант трека\n"
-        "\n"
-        "🖼 *Фото*\n"
-        "• Фото + *«улучши фото»* — увеличу в 3× в высоком качестве\n"
-        "• Фото + *«процент текста»* — покажу долю текста на изображении\n"
-        "• Фото + *«до 200кб»* — сожму до нужного размера\n"
-        "• *«покажи закат»* / *«фото машины»* — найду и пришлю фото из сети\n"
-        "\n"
-        "📦 *Архивы ZIP*\n"
-        "• ZIP с картинками — переименую файлы по размеру (напр. 1920x1080.jpg)\n"
-        "• ZIP + *«до 512кб»* — сожму картинки, превышающие указанный размер\n"
-        "• ZIP + *«собери гиф»* — соберу GIF из групп картинок\n"
-        "\n"
-        "🔤 *Шрифты*\n"
-        "• *«шрифт Roboto»* — найду и пришлю TTF с выбором начертания\n"
-        "• /font Roboto — то же самое через команду",
-        parse_mode="Markdown",
+        "🤖 AI Bot\n\n"
+        "Просто пиши — отвечаю как живой человек.\n\n"
+        "🔍 «Что такое квантовая механика?» или «расскажи про Маска» — найду актуальную информацию в интернете и пришлю со структурой и картинками.\n"
+        "🎤 Отправь голосовое с музыкой — распознаю песню и пришлю файлом (Shazam + AudD).\n"
+        "🎤 Можешь напевать мелодию голосом — тоже попробую распознать.\n"
+        "🖼 «Пришли инструкцию в картинках как заменить смеситель» — найду и пришлю фото.\n"
+        "🎬 «Пришли видео инструкцию по замене масла в машине» — найду видео на YouTube.\n"
+        "🎵 «Пришли музыку из фильма Интерстеллар» — найду и скачаю саундтрек.\n"
+        "🎵 Напиши «музыка <артист - название>» — скачаю трек (YouTube, SoundCloud, Deezer).\n"
+        "📥 Отправь ссылку Instagram или YouTube — скачаю видео.\n"
+        "▶️ Напиши «шортс [название]» — найду и пришлю YouTube Shorts по ключевым словам.\n"
+        "🎵 Напиши «тикток [название]» — найду и пришлю видео из TikTok по ключевым словам.\n"
+        "🔁 Напиши «еще» после любого видео или музыки — пришлю следующий результат.\n"
+        "🎧 Отправь ссылку VK / SoundCloud / Deezer — скачаю аудио.\n"
+        "✂️ Отправь одно фото — удалю фон.\n"
+        "🗜 Отправь фото с подписью «до 500кб» — сожму.\n"
+        "📦 Отправь несколько фото с подписью «до 300кб» — сожму и пришлю архивом.\n"
+        "🏷 Отправь .zip с картинками — переименую файлы по размеру в пикселях (напр. 240x400.jpg).\n"
+        "📝 Отправь фото с подписью «процент текста» — покажу сколько % площади занимает текст.\n"
+        "🔬 Отправь фото с подписью «улучши фото» — увеличу в 3x и пришлю файлом в высоком качестве.\n"
+        "🔤 Напиши «шрифт <название>» — найду и пришлю бесплатный TTF-файл (например: шрифт Roboto).",
         reply_markup=main_keyboard()
     )
 
@@ -2340,65 +2131,8 @@ async def groq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    with _memory_lock:
-        user_memory[user_id] = []
+    user_memory[user_id] = []
     await update.message.reply_text("🗑 Память очищена", reply_markup=main_keyboard())
-
-
-async def _do_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Copy the owner's message to all known users and report results."""
-    msg = update.message
-    with _users_lock:
-        recipients = list(known_users)
-
-    total = len(recipients)
-    status = await msg.reply_text(f"📢 Начинаю рассылку для {total} пользователей…")
-
-    sent = 0
-    failed = 0
-    for uid in recipients:
-        if uid == OWNER_ID:
-            continue
-        try:
-            await context.bot.copy_message(
-                chat_id=uid,
-                from_chat_id=msg.chat_id,
-                message_id=msg.message_id,
-            )
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
-
-    await status.edit_text(
-        f"✅ Рассылка завершена\n"
-        f"📨 Отправлено: {sent}\n"
-        f"❌ Не доставлено: {failed}"
-    )
-
-
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if OWNER_ID == 0 or user_id != OWNER_ID:
-        return
-    with _users_lock:
-        count = len(known_users)
-    broadcast_pending.add(user_id)
-    await update.message.reply_text(
-        f"📢 Режим рассылки включён.\n"
-        f"👥 Пользователей в базе: {count}\n\n"
-        "Отправь любое сообщение (текст, фото, видео, файл) — оно уйдёт всем.\n"
-        "Для отмены напиши /cancel"
-    )
-
-
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id in broadcast_pending:
-        broadcast_pending.discard(user_id)
-        await update.message.reply_text("❌ Рассылка отменена.")
-    else:
-        await update.message.reply_text("Нечего отменять.")
 
 
 def _font_keyboard() -> InlineKeyboardMarkup:
@@ -2456,93 +2190,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass  # Ignore expired callback queries
 
     if query.data == "reset_memory":
-        with _memory_lock:
-            user_memory[user_id] = []
+        user_memory[user_id] = []
         await query.message.reply_text("🗑 Память очищена")
-
-    elif query.data == "next_video":
-        state = video_search_state.get(user_id)
-        if not state:
-            await query.message.reply_text("⚠ Нет активного поиска видео.")
-            return
-        status = await query.message.reply_text("🔄 Ищу следующий вариант…")
-        await _send_next_video(
-            query.message.reply_video,
-            query.message.reply_document,
-            query.message.reply_text,
-            user_id, status,
-        )
-
-    elif query.data == "next_music":
-        state = music_search_state.get(user_id)
-        if not state:
-            await query.message.reply_text("⚠ Нет активного поиска музыки. Отправь новый запрос.")
-            return
-        candidates = state.get("candidates", [])
-        idx = state.get("idx", 0) + 1
-        original_query = state.get("query", "")
-        loop = asyncio.get_running_loop()
-
-        # Find next downloadable candidate
-        status = await query.message.reply_text("🔄 Ищу другой трек…")
-        sent = False
-        while idx < len(candidates):
-            cand = candidates[idx]
-            state["idx"] = idx
-            try:
-                await status.edit_text(f"⬇️ Скачиваю: «{cand['title'][:50]}»…")
-                audio_bytes, title, artist = await asyncio.wait_for(
-                    loop.run_in_executor(_EXECUTOR, download_music_from_candidate, cand),
-                    timeout=120,
-                )
-                await status.edit_text("📤 Загружаю…")
-                await _safe_send_audio(
-                    query.message, audio_bytes,
-                    filename=f"{title}.mp3", title=title, performer=artist,
-                    reply_markup=_music_keyboard(),
-                )
-                await status.delete()
-                sent = True
-                break
-            except asyncio.TimeoutError:
-                idx += 1
-                continue
-            except Exception:
-                idx += 1
-                continue
-
-        if not sent:
-            # All candidates exhausted — try fetching more with a fresh search
-            try:
-                await status.edit_text("🔍 Ищу ещё треки…")
-                extra = await loop.run_in_executor(
-                    _EXECUTOR, search_music_candidates,
-                    original_query + " alternative" if original_query else original_query
-                )
-                # Filter already-seen
-                seen_urls = {c["url"] for c in candidates}
-                new_cands = [c for c in extra if c["url"] not in seen_urls]
-                if new_cands:
-                    state["candidates"] = candidates + new_cands
-                    cand = new_cands[0]
-                    state["idx"] = len(candidates)
-                    await status.edit_text(f"⬇️ Скачиваю: «{cand['title'][:50]}»…")
-                    audio_bytes, title, artist = await asyncio.wait_for(
-                        loop.run_in_executor(_EXECUTOR, download_music_from_candidate, cand),
-                        timeout=120,
-                    )
-                    await status.edit_text("📤 Загружаю…")
-                    await _safe_send_audio(
-                        query.message, audio_bytes,
-                        filename=f"{title}.mp3", title=title, performer=artist,
-                        reply_markup=_music_keyboard(),
-                    )
-                    await status.delete()
-                else:
-                    await status.edit_text("😔 Больше вариантов нет. Попробуй другой запрос.")
-                    music_search_state.pop(user_id, None)
-            except Exception as e:
-                await status.edit_text(f"😔 Больше вариантов нет. Попробуй другой запрос.")
 
     elif query.data.startswith("fs:"):
         style = query.data[3:]
@@ -2587,314 +2236,106 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text(f"⚠ {e}")
 
 
-# ===== VIDEO SEARCH HANDLER =====
+# ===== "ЕЩЕ" HANDLER =====
 
-async def _handle_video_search(update: Update, query: str):
-    """Search multiple platforms and send the first downloadable video."""
-    user_id = update.message.from_user.id
+async def _send_more_result(update, context, user_id: int) -> None:
+    """Send the next cached result when user says 'еще'."""
+    cache = user_more_cache.get(user_id)
+    if not cache:
+        await update.message.reply_text("Сначала сделай запрос, потом скажи «еще».")
+        return
+
+    kind = cache["type"]
+    entries = cache["entries"]
+    idx = cache["index"]
+    query = cache["query"]
     loop = asyncio.get_running_loop()
 
-    status = await update.message.reply_text(
-        f"🎬 Ищу видео: «{query[:60]}»…\n🔍 YouTube"
-    )
+    if idx >= len(entries):
+        await update.message.reply_text(
+            f"Больше результатов по запросу «{query}» нет.\n"
+            "Попробуй другой запрос."
+        )
+        user_more_cache.pop(user_id, None)
+        return
+
+    msg = await update.message.reply_text(f"🔄 Ищу другой результат ({idx + 1}/{len(entries)})...")
+    result = None
+
+    # Advance index so repeated "еще" won't retry same entry on failure
+    cache["index"] = idx + 1
 
     try:
-        entries = await asyncio.wait_for(
-            loop.run_in_executor(_EXECUTOR, _collect_video_entries, query),
-            timeout=35,
-        )
-    except asyncio.TimeoutError:
-        await status.edit_text("⏱ Поиск завис, попробуй ещё раз.")
-        return
-
-    if not entries:
-        await status.edit_text(f"😔 Ничего не нашёл по запросу «{query}».")
-        with _memory_lock:
-            history = user_memory.get(user_id, [])
-            history.append({"role": "user", "content": f"найди видео {query}"})
-            history.append({"role": "assistant", "content": f"Поискал видео «{query}» на YouTube, Dailymotion, Rutube и Vimeo — вообще ничего не нашёл. Попробуй переформулировать запрос или уточни что именно хочешь посмотреть."})
-            user_memory[user_id] = history[-10:]
-        return
-
-    # Save state for "Next" button
-    video_search_state[user_id] = {
-        "query": query,
-        "entries": entries,
-        "sent_ids": set(),
-    }
-
-    await _send_next_video(update.message.reply_video,
-                           update.message.reply_document,
-                           update.message.reply_text,
-                           user_id, status)
-
-
-async def _send_next_video(reply_video_fn, reply_doc_fn, reply_text_fn, user_id: int, status_msg):
-    """Try platforms one by one until a video is sent or all options exhausted."""
-    state = video_search_state.get(user_id)
-    if not state:
-        await status_msg.edit_text("⚠ Нет активного поиска.")
-        return
-
-    loop = asyncio.get_running_loop()
-    tried_platforms: set[str] = set()
-    yt_blocked = False  # skip all YouTube entries if auth error detected
-
-    while True:
-        entry = _next_unsent_entry(state)
-        if entry is None:
-            # All entries exhausted — send YouTube link with natural AI explanation
-            query_text = state.get("query", "видео")
-            video_search_state.pop(user_id, None)
-            yt_link = f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(query_text)}"
-            system_extra = (
-                f"ВАЖНО: Ты пытался найти и прислать видео «{query_text}», "
-                f"перебрал YouTube, Dailymotion, Rutube и Vimeo, но все ролики оказались "
-                f"слишком большими или недоступными для загрузки в Telegram. "
-                f"Скажи об этом честно и коротко, предложи открыть поиск по ссылке: {yt_link} "
-                f"(вставь ссылку прямо в ответ). Говори в своём обычном стиле."
-            )
-            try:
-                ai_text = await loop.run_in_executor(
-                    None, ask_groq, user_id, f"видео {query_text}", system_extra
+        if kind == "shorts":
+            result = await loop.run_in_executor(None, _dl_short_by_entry, entries[idx])
+            if result:
+                data, title = result
+                await update.message.reply_video(
+                    video=io.BytesIO(data),
+                    caption=f"▶️ {title}",
+                    supports_streaming=True,
                 )
-                await reply_text_fn(ai_text)
-            except Exception:
-                await reply_text_fn(
-                    f"Блять, все ролики по «{query_text}» оказались либо слишком большими, "
-                    f"либо вообще не качаются. Сам посмотри тут: {yt_link}"
-                )
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-            return
-
-        state["sent_ids"].add(entry["id"])
-        platform = entry.get("platform", "")
-        title = entry.get("title", "")
-        dur = entry.get("duration") or 0
-        dur_str = f"{int(dur)//60}:{int(dur)%60:02d}" if dur else "?"
-
-        # Skip YouTube entries quickly if it was already blocked by auth
-        if yt_blocked and platform == "YouTube":
-            print(f"[video] skipping YouTube (auth blocked): {title[:60]}", flush=True)
-            continue
-
-        # Show which platform we're trying now
-        if platform not in tried_platforms:
-            tried_platforms.add(platform)
-            try:
-                await status_msg.edit_text(
-                    f"🔍 Пробую {platform}…\n🎬 {title[:60]}"
-                )
-            except Exception:
-                pass
-        else:
-            try:
-                await status_msg.edit_text(
-                    f"⬇️ Скачиваю с {platform}…\n🎬 {title[:60]}"
-                )
-            except Exception:
-                pass
-
-        try:
-            vid_bytes, vid_title = await asyncio.wait_for(
-                loop.run_in_executor(_EXECUTOR, _download_video_url, entry["url"], title),
-                timeout=60,
-            )
-        except asyncio.TimeoutError:
-            print(f"[video] timeout: {entry['url'][:80]}", flush=True)
-            continue
-        except Exception as _ve:
-            err_str = str(_ve).lower()
-            if platform == "YouTube" and any(k in err_str for k in _YT_BOT_ERRORS):
-                yt_blocked = True
-                print(f"[video] YouTube auth blocked, skipping remaining YT entries", flush=True)
+                await msg.delete()
             else:
-                print(f"[video] fail ({platform}): {str(_ve)[:120]}", flush=True)
-            continue
+                await msg.edit_text("Этот шортс не загружается. Напиши «еще» для следующего.")
 
-        # Success — send the video
-        size_mb = len(vid_bytes) / (1024 * 1024)
-        caption = (
-            f"🎬 {vid_title or title}\n"
-            f"⏱ {dur_str}  💾 {size_mb:.1f} МБ  📺 {platform}"
-        )
-        safe_name = re.sub(r'[^\w\s-]', '', title)[:40].strip().replace(' ', '_') or "video"
-
-        try:
-            await status_msg.edit_text("📤 Отправляю…")
-            await reply_video_fn(
-                video=io.BytesIO(vid_bytes),
-                filename=f"{safe_name}.mp4",
-                caption=caption,
-                reply_markup=_video_keyboard(),
-                supports_streaming=True,
-            )
-        except Exception:
-            try:
-                await reply_doc_fn(
-                    document=io.BytesIO(vid_bytes),
-                    filename=f"{safe_name}.mp4",
+        elif kind == "tiktok":
+            result = await loop.run_in_executor(None, _dl_tiktok_by_video, entries[idx])
+            if result:
+                data, caption = result
+                await update.message.reply_video(
+                    video=io.BytesIO(data),
                     caption=caption,
-                    reply_markup=_video_keyboard(),
+                    supports_streaming=True,
                 )
-            except Exception as e:
-                # File too large for Telegram — try next entry
-                print(f"[video] telegram send failed ({platform}): {str(e)[:120]}", flush=True)
-                try:
-                    await status_msg.edit_text(
-                        f"⚠ Файл слишком большой ({size_mb:.0f} МБ), ищу другой вариант…"
-                    )
-                except Exception:
-                    pass
-                continue
+                await msg.delete()
+            else:
+                await msg.edit_text("Это видео недоступно. Напиши «еще» для следующего.")
 
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-        return
+        elif kind == "video":
+            result = await loop.run_in_executor(None, _dl_yt_video_by_entry, entries[idx])
+            if result:
+                data, title = result
+                await update.message.reply_video(
+                    video=io.BytesIO(data),
+                    caption=f"📹 {title}",
+                    supports_streaming=True,
+                )
+                await msg.delete()
+            else:
+                await msg.edit_text("Видео недоступно. Напиши «еще» для следующего.")
 
-
-# ===== AUTO-UPLOAD HELPERS =====
-
-_TG_SEND_LIMIT = 50 * 1024 * 1024  # 50 MB — Telegram bot send limit
-
-
-async def _safe_send_audio(
-    message,
-    data: bytes,
-    filename: str,
-    title: str = "",
-    performer: str = "",
-    caption: str = "",
-    reply_markup=None,
-) -> None:
-    """Send audio directly to Telegram. If audio upload fails, send it as a document."""
-    size_mb = len(data) / (1024 * 1024)
-    if len(data) > _TG_SEND_LIMIT:
-        raise ValueError(f"Файл слишком большой для Telegram ({size_mb:.0f} МБ).")
-
-    audio_kwargs = dict(
-        audio=io.BytesIO(data),
-        filename=filename,
-        title=(title or filename)[:64],
-        performer=(performer or "")[:64],
-        caption=caption or None,
-    )
-    if reply_markup is not None:
-        audio_kwargs["reply_markup"] = reply_markup
-
-    try:
-        await message.reply_audio(**audio_kwargs)
-        return
+        elif kind == "music":
+            result = await loop.run_in_executor(None, _dl_music_by_entry, entries[idx])
+            if result:
+                audio_bytes, title, artist = result
+                await update.message.reply_audio(
+                    audio=io.BytesIO(audio_bytes),
+                    filename=f"{title}.mp3",
+                    title=title,
+                    performer=artist,
+                )
+                await msg.delete()
+            else:
+                await msg.edit_text("Трек недоступен. Напиши «еще» для следующего.")
     except Exception as e:
-        print(f"[audio] reply_audio failed, trying document: {str(e)[:200]}", flush=True)
-
-    doc_kwargs = dict(
-        document=io.BytesIO(data),
-        filename=filename,
-        caption=caption or title or None,
-    )
-    if reply_markup is not None:
-        doc_kwargs["reply_markup"] = reply_markup
-    await message.reply_document(**doc_kwargs)
-
-
-async def _safe_send_doc(
-    message,
-    data: bytes,
-    filename: str,
-    caption: str = "",
-    reply_markup=None,
-) -> None:
-    size_mb = len(data) / (1024 * 1024)
-    if len(data) > _TG_SEND_LIMIT:
-        raise ValueError(f"Файл слишком большой для Telegram ({size_mb:.0f} МБ).")
-
-    kwargs = dict(
-        document=io.BytesIO(data),
-        filename=filename,
-        caption=caption or None,
-    )
-    if reply_markup is not None:
-        kwargs["reply_markup"] = reply_markup
-    await message.reply_document(**kwargs)
+        await msg.edit_text(f"⚠ Ошибка: {e}\nНапиши «еще» для следующего.")
 
 
 # ===== CHAT =====
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    _register_user(user_id)
     text = update.message.text.strip()
 
     if not text:
         await update.message.reply_text("Отправь сообщение.")
         return
 
-    # Broadcast mode: owner sends text to all users
-    if user_id == OWNER_ID and user_id in broadcast_pending:
-        broadcast_pending.discard(user_id)
-        await _do_broadcast(update, context)
+    # "Еще" — send next cached result
+    if MORE_RE.match(text) and user_id in user_more_cache:
+        await _send_more_result(update, context, user_id)
         return
-
-    # Check if user is in GIF building flow
-    if user_id in gif_pending:
-        state = gif_pending[user_id]
-        if state["step"] == "fps":
-            try:
-                fps = float(text.replace(",", "."))
-                if fps <= 0:
-                    raise ValueError()
-            except ValueError:
-                await update.message.reply_text("⚠ Введи корректное число, например `0.5` или `1`", parse_mode="Markdown")
-                return
-            state["fps"] = fps
-            state["step"] = "maxsize"
-            await update.message.reply_text(
-                "📏 До какого веса (в КБ) сжать каждый GIF?\n"
-                "Напиши число, например: `200` или `500`",
-                parse_mode="Markdown"
-            )
-            return
-        elif state["step"] == "maxsize":
-            try:
-                max_kb = int(text.replace(",", ".").split(".")[0])
-                if max_kb <= 0:
-                    raise ValueError()
-            except ValueError:
-                await update.message.reply_text("⚠ Введи целое число в КБ, например `200`", parse_mode="Markdown")
-                return
-            pending = gif_pending.pop(user_id)
-            zip_bytes = pending["zip_bytes"]
-            fps = pending["fps"]
-            msg = await update.message.reply_text(
-                f"🎞 Собираю GIF-файлы (⏱ {fps} сек/кадр, 📏 до {max_kb} КБ каждый)..."
-            )
-            try:
-                loop = asyncio.get_running_loop()
-                result_zip, created = await loop.run_in_executor(
-                    None, build_gifs_from_zip, zip_bytes, fps, max_kb
-                )
-                if not created:
-                    await msg.edit_text(
-                        "⚠ Не нашёл подходящих групп изображений.\n"
-                        "Убедись, что файлы в архиве называются как `240х400_1.png`, `240х400_2.png` и т.д."
-                    )
-                    return
-                names_list = "\n".join(f"• {n}" for n in created)
-                await _safe_send_doc(
-                    update.message, result_zip,
-                    filename="gifs.zip",
-                    caption=f"✅ Готово! Создано GIF-файлов: {len(created)}\n{names_list}",
-                )
-                await msg.delete()
-            except Exception as e:
-                await msg.edit_text(f"⚠ Ошибка при создании GIF: {e}")
-            return
 
     # Check if user is waiting to provide font style
     if user_id in font_pending:
@@ -2951,44 +2392,37 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Bare "видео" / "ролик" — ask what to search ──────────────────────────
-    if VIDEO_BARE_RE.match(text):
-        await update.message.reply_text(
-            "🎬 Что найти? Напиши запрос, например:\n"
-            "• видео котики\n• трейлер Джокер\n• ролик как приготовить пасту"
-        )
-        return
-
-    # ── Direct video search: "видео <query>", "трейлер <query>", "найди видео <query>" ──
-    vs_match = VIDEO_SEARCH_RE.match(text)
-    if vs_match:
-        query = (vs_match.group(1) or vs_match.group(2) or "").strip()
-        if query:
-            await _handle_video_search(update, query)
-            return
-
     # Check if message is a music request ("музыка <query>")
     music_match = MUSIC_RE.match(text)
     if music_match:
         query = music_match.group(1).strip()
-        msg = await update.message.reply_text(f"🔍 Ищу: {query}…")
-        loop = asyncio.get_running_loop()
+        msg = await update.message.reply_text(f"🔍 Ищу: {query}...")
         try:
-            result, candidates, used_idx = await asyncio.wait_for(
-                loop.run_in_executor(_EXECUTOR, search_and_download_first_music, query),
-                timeout=150,
-            )
-            audio_bytes, title, artist = result
-            music_search_state[user_id] = {"candidates": candidates, "idx": used_idx, "query": query}
-            await msg.edit_text("📤 Загружаю файл…")
-            await _safe_send_audio(
-                update.message, audio_bytes,
-                filename=f"{title}.mp3", title=title, performer=artist,
-                reply_markup=_music_keyboard(),
+            loop = asyncio.get_running_loop()
+            candidates = await loop.run_in_executor(None, _search_music_candidates, query)
+            if candidates:
+                user_more_cache[user_id] = {"type": "music", "query": query, "entries": candidates, "index": 1}
+                result = await loop.run_in_executor(None, _dl_music_by_entry, candidates[0])
+                if result:
+                    audio_bytes, title, artist = result
+                    await update.message.reply_audio(
+                        audio=io.BytesIO(audio_bytes),
+                        filename=f"{title}.mp3",
+                        title=title,
+                        performer=artist,
+                        caption="💬 Напиши «еще» чтобы получить другой трек",
+                    )
+                    await msg.delete()
+                    return
+            audio_bytes, title, artist = await loop.run_in_executor(None, download_music, query)
+            await msg.edit_text("📤 Загружаю файл...")
+            await update.message.reply_audio(
+                audio=io.BytesIO(audio_bytes),
+                filename=f"{title}.mp3",
+                title=title,
+                performer=artist,
             )
             await msg.delete()
-        except asyncio.TimeoutError:
-            await msg.edit_text("⏱ Превышено время ожидания. Попробуй ещё раз.")
         except Exception as e:
             await msg.edit_text(f"⚠ Ошибка: {e}")
         return
@@ -3010,69 +2444,98 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await update.message.reply_text(f"🎵 Скачиваю аудио с {source}...")
         try:
             loop = asyncio.get_running_loop()
-            audio_bytes, title, artist = await loop.run_in_executor(_EXECUTOR, download_audio_url, url)
-            await _safe_send_audio(
-                update.message, audio_bytes,
-                filename=f"{title}.mp3", title=title, performer=artist,
+            audio_bytes, title, artist = await loop.run_in_executor(None, download_audio_url, url)
+            await update.message.reply_audio(
+                audio=io.BytesIO(audio_bytes),
+                filename=f"{title}.mp3",
+                title=title,
+                performer=artist,
             )
             await msg.delete()
         except Exception as e:
             await msg.edit_text(f"⚠ {e}")
         return
 
-    # ── Image search: "покажи кота", "фото машины", "как выглядит ..." ────────
-    if IMAGE_RE.search(text):
-        query = extract_image_query(text)
-        if not query:
-            await update.message.reply_text("🔍 Что именно показать? Напиши, например: «покажи закат»")
-            return
-        status = await update.message.reply_text("🔍 Ищу фото…")
-        loop = asyncio.get_running_loop()
+    # Check for TikTok search request
+    tiktok_match = TIKTOK_SEARCH_RE.match(text)
+    if tiktok_match:
+        query = tiktok_match.group(1).strip()
+        msg = await update.message.reply_text(f"🔍 Ищу в TikTok: «{query}»...")
         try:
-            results = await asyncio.wait_for(
-                loop.run_in_executor(_EXECUTOR, search_images, query, 5, True),
-                timeout=20,
-            )
-        except Exception:
-            results = []
-        if not results:
-            await status.edit_text("😔 Не удалось найти подходящие фото. Попробуй другой запрос.")
-            return
-        await status.edit_text("📥 Загружаю фото…")
-        sent = 0
-        media_group = []
-        for item in results:
-            try:
-                img_bytes = await asyncio.wait_for(
-                    loop.run_in_executor(_EXECUTOR, download_image, item["url"]),
-                    timeout=8,
+            loop = asyncio.get_running_loop()
+            candidates = await loop.run_in_executor(None, _search_tiktok_candidates, query)
+            if not candidates:
+                await msg.edit_text(f"Ничего не найдено в TikTok по запросу «{query}».")
+                return
+            user_more_cache[user_id] = {"type": "tiktok", "query": query, "entries": candidates, "index": 1}
+            result = await loop.run_in_executor(None, _dl_tiktok_by_video, candidates[0])
+            if result:
+                data, caption = result
+                await update.message.reply_video(
+                    video=io.BytesIO(data),
+                    caption=caption + "\n\n💬 Напиши «еще» чтобы получить другой результат",
+                    supports_streaming=True,
                 )
-                from telegram import InputMediaPhoto as _IMP
-                media_group.append(
-                    _IMP(
-                        media=io.BytesIO(img_bytes),
-                        caption=item["title"][:1000] if sent == 0 else None,
-                    )
-                )
-                sent += 1
-            except Exception:
-                continue
-            if sent >= 4:
-                break
-        if not media_group:
-            await status.edit_text(f"😔 Не удалось загрузить фото по запросу «{query}».")
-            return
-        try:
-            if len(media_group) == 1:
-                await update.message.reply_photo(
-                    photo=media_group[0].media,
-                    caption=media_group[0].caption,
-                )
+                await msg.delete()
             else:
-                await update.message.reply_media_group(media=media_group)
-            await status.delete()
+                await msg.edit_text("Видео недоступно. Напиши «еще» для следующего.")
         except Exception as e:
-            await status.edit_text(f"⚠ Ошибка отправки: {e}")
+            await msg.edit_text(f"⚠ {e}")
+        return
+
+    # Check for Shorts search request
+    shorts_match = SHORTS_SEARCH_RE.match(text)
+    if shorts_match:
+        query = shorts_match.group(1).strip()
+        msg = await update.message.reply_text(f"🔍 Ищу шортс: «{query}»...")
+        try:
+            loop = asyncio.get_running_loop()
+            candidates = await loop.run_in_executor(None, _search_shorts_candidates, query)
+            if not candidates:
+                await msg.edit_text(f"YouTube не вернул результатов по запросу «{query}».")
+                return
+            user_more_cache[user_id] = {"type": "shorts", "query": query, "entries": candidates, "index": 1}
+            result = await loop.run_in_executor(None, _dl_short_by_entry, candidates[0])
+            if result:
+                data, title = result
+                await update.message.reply_video(
+                    video=io.BytesIO(data),
+                    caption=f"▶️ {title}\n\n💬 Напиши «еще» чтобы получить другой шортс",
+                    supports_streaming=True,
+                )
+                await msg.delete()
+            else:
+                await msg.edit_text("Шортс не загрузился. Напиши «еще» для следующего.")
+        except Exception as e:
+            await msg.edit_text(f"⚠ {e}")
+        return
+
+    # Check for Instagram, YouTube or TikTok link
+    ig_match = INSTAGRAM_RE.search(text)
+    yt_match = YOUTUBE_RE.search(text)
+    tt_match = TIKTOK_URL_RE.search(text)
+    video_match = ig_match or yt_match or tt_match
+
+    if video_match:
+        url = video_match.group(0)
+        if yt_match:
+            source = "YouTube"
+        elif ig_match:
+            source = "Instagram"
+        else:
+            source = "TikTok"
+        msg = await update.message.reply_text(f"📥 Скачиваю видео с {source}...")
+        try:
+            loop = asyncio.get_running_loop()
+            video_bytes, title = await loop.run_in_executor(None, download_video, url)
+            await update.message.reply_video(
+                video=io.BytesIO(video_bytes),
+                caption=f"📹 {title}",
+                supports_streaming=True
+            )
+            await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"⚠ {e}")
         return
 
     # ── Smart internet media search ──────────────────────────────────────────
@@ -3080,79 +2543,94 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         msg = await update.message.reply_text("🔍 Понимаю запрос…")
         try:
-            intent_data = await loop.run_in_executor(_EXECUTOR, classify_intent, text)
+            intent_data = await loop.run_in_executor(None, classify_intent, text)
             intent = intent_data.get("intent", "chat")
             query  = intent_data.get("query", text)
 
             if intent == "images":
                 await msg.edit_text(f"🖼 Ищу картинки: «{query}»…")
-                images = await loop.run_in_executor(_EXECUTOR, search_images, query, 5, True)
+                images = await loop.run_in_executor(None, search_images, query)
+                # If nothing found with the primary query, try a simpler fallback
                 if not images and query != text:
-                    images = await loop.run_in_executor(_EXECUTOR, search_images, text, 5, True)
+                    images = await loop.run_in_executor(None, search_images, text)
                 if not images:
                     await msg.edit_text(
                         "😔 Не удалось найти картинки по этому запросу.\n"
-                        "Попробуй сформулировать иначе или уточнить запрос."
+                        "Попробуй сформулировать иначе или на английском."
                     )
                     return
                 from telegram import InputMediaPhoto
-                media_group = []
-                for i, item in enumerate(images):
-                    try:
-                        img_bytes = await asyncio.wait_for(
-                            loop.run_in_executor(_EXECUTOR, download_image, item["url"]),
-                            timeout=8,
-                        )
-                        media_group.append(InputMediaPhoto(
-                            media=io.BytesIO(img_bytes),
-                            caption=f"🔎 {query}" if i == 0 else None,
-                        ))
-                    except Exception:
-                        continue
-                    if len(media_group) >= 4:
-                        break
-                if media_group:
-                    if len(media_group) == 1:
-                        await update.message.reply_photo(
-                            photo=media_group[0].media,
-                            caption=media_group[0].caption,
-                        )
-                    else:
-                        await update.message.reply_media_group(media=media_group)
-                    await msg.delete()
-                else:
-                    await msg.edit_text("😔 Не удалось загрузить картинки.")
+                media_group = [
+                    InputMediaPhoto(
+                        media=io.BytesIO(img),
+                        caption=f"🔎 {query}" if i == 0 else None,
+                    )
+                    for i, img in enumerate(images)
+                ]
+                await update.message.reply_media_group(media=media_group)
+                await msg.delete()
                 return
 
             if intent == "video":
-                await msg.delete()
-                await _handle_video_search(update, query)
+                await msg.edit_text(f"🎬 Ищу видео: «{query}»…")
+                try:
+                    candidates = await loop.run_in_executor(None, _search_yt_video_candidates, query)
+                    if candidates:
+                        user_more_cache[user_id] = {"type": "video", "query": query, "entries": candidates, "index": 1}
+                        result = await loop.run_in_executor(None, _dl_yt_video_by_entry, candidates[0])
+                        if result:
+                            data, title = result
+                            await update.message.reply_video(
+                                video=io.BytesIO(data),
+                                caption=f"📹 {title}\n\n💬 Напиши «еще» чтобы получить другое видео",
+                                supports_streaming=True,
+                            )
+                            await msg.delete()
+                            return
+                    video_bytes, title = await loop.run_in_executor(None, search_video_yt, query)
+                    await update.message.reply_video(
+                        video=io.BytesIO(video_bytes),
+                        caption=f"📹 {title}",
+                        supports_streaming=True,
+                    )
+                    await msg.delete()
+                except Exception as e:
+                    await msg.edit_text(f"⚠ Не нашёл видео: {e}")
                 return
 
             if intent == "music":
                 await msg.edit_text(f"🎵 Ищу музыку: «{query}»…")
                 try:
-                    result, candidates, used_idx = await asyncio.wait_for(
-                        loop.run_in_executor(_EXECUTOR, search_and_download_first_music, query),
-                        timeout=150,
-                    )
-                    audio_bytes, title, artist = result
-                    music_search_state[user_id] = {"candidates": candidates, "idx": used_idx, "query": query}
-                    await _safe_send_audio(
-                        update.message, audio_bytes,
-                        filename=f"{title}.mp3", title=title, performer=artist,
-                        reply_markup=_music_keyboard(),
+                    candidates = await loop.run_in_executor(None, _search_music_candidates, query)
+                    if candidates:
+                        user_more_cache[user_id] = {"type": "music", "query": query, "entries": candidates, "index": 1}
+                        result = await loop.run_in_executor(None, _dl_music_by_entry, candidates[0])
+                        if result:
+                            audio_bytes, title, artist = result
+                            await update.message.reply_audio(
+                                audio=io.BytesIO(audio_bytes),
+                                filename=f"{title}.mp3",
+                                title=title,
+                                performer=artist,
+                                caption="💬 Напиши «еще» чтобы получить другой трек",
+                            )
+                            await msg.delete()
+                            return
+                    audio_bytes, title, artist = await loop.run_in_executor(None, download_music, query)
+                    await update.message.reply_audio(
+                        audio=io.BytesIO(audio_bytes),
+                        filename=f"{title}.mp3",
+                        title=title,
+                        performer=artist,
                     )
                     await msg.delete()
-                except asyncio.TimeoutError:
-                    await msg.edit_text("⏱ Превышено время ожидания. Попробуй ещё раз.")
                 except Exception as e:
                     await msg.edit_text(f"⚠ Не нашёл музыку: {e}")
                 return
 
             if intent == "info":
                 await msg.edit_text(f"🔍 Ищу информацию: «{query}»…")
-                answer, image_query = await loop.run_in_executor(_EXECUTOR, search_web_info, query)
+                answer, image_query = await loop.run_in_executor(None, search_web_info, query)
                 if not answer:
                     await msg.edit_text(
                         "😔 Не нашёл актуальной информации по этому запросу.\n"
@@ -3164,21 +2642,11 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     await msg.edit_text(answer)
                 if image_query:
-                    imgs = await loop.run_in_executor(_EXECUTOR, search_images, image_query, 3)
+                    imgs = await loop.run_in_executor(None, search_images, image_query, 3)
                     if imgs:
                         from telegram import InputMediaPhoto
-                        media = []
-                        for item in imgs:
-                            try:
-                                img_bytes = await asyncio.wait_for(
-                                    loop.run_in_executor(_EXECUTOR, download_image, item["url"]),
-                                    timeout=8,
-                                )
-                                media.append(InputMediaPhoto(media=io.BytesIO(img_bytes)))
-                            except Exception:
-                                continue
-                        if media:
-                            await update.message.reply_media_group(media=media)
+                        media = [InputMediaPhoto(media=io.BytesIO(img)) for img in imgs]
+                        await update.message.reply_media_group(media=media)
                 return
 
             # intent == "chat" — fall through to regular AI chat
@@ -3192,49 +2660,26 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     # ─────────────────────────────────────────────────────────────────────────
 
-    # ── Direct info search (расписания, факты, локальные запросы, вопросы с ?) ──
-    is_question = text.rstrip().endswith('?')
-    if INFO_RE.search(text) or is_question:
+    # ── Direct info search (что такое X, кто такой X, как работает X, etc.) ──
+    if INFO_RE.search(text):
         loop = asyncio.get_running_loop()
         msg = await update.message.reply_text("🔍 Ищу актуальную информацию…")
         try:
-            # Use classify_intent to get an optimized search query
-            intent_data = await loop.run_in_executor(_EXECUTOR, classify_intent, text)
-            intent = intent_data.get("intent", "info")
-            search_query = intent_data.get("query", text)
-
-            # If AI says it's a chat question (joke, opinion), skip web search
-            if intent == "chat" and not INFO_RE.search(text):
-                await msg.delete()
-            else:
-                await msg.edit_text(f"🔍 Ищу: «{search_query}»…")
-                answer, image_query = await loop.run_in_executor(
-                    None, search_web_info, search_query
-                )
-                if answer:
-                    try:
-                        await msg.edit_text(answer, parse_mode="Markdown")
-                    except Exception:
-                        await msg.edit_text(answer)
-                    if image_query:
-                        imgs = await loop.run_in_executor(_EXECUTOR, search_images, image_query, 3)
-                        if imgs:
-                            from telegram import InputMediaPhoto
-                            media = []
-                            for item in imgs:
-                                try:
-                                    img_bytes = await asyncio.wait_for(
-                                        loop.run_in_executor(_EXECUTOR, download_image, item["url"]),
-                                        timeout=8,
-                                    )
-                                    media.append(InputMediaPhoto(media=io.BytesIO(img_bytes)))
-                                except Exception:
-                                    continue
-                            if media:
-                                await update.message.reply_media_group(media=media)
-                    return
-                # If no results — fall through to AI chat
-                await msg.delete()
+            answer, image_query = await loop.run_in_executor(None, search_web_info, text)
+            if answer:
+                try:
+                    await msg.edit_text(answer, parse_mode="Markdown")
+                except Exception:
+                    await msg.edit_text(answer)
+                if image_query:
+                    imgs = await loop.run_in_executor(None, search_images, image_query, 3)
+                    if imgs:
+                        from telegram import InputMediaPhoto
+                        media = [InputMediaPhoto(media=io.BytesIO(img)) for img in imgs]
+                        await update.message.reply_media_group(media=media)
+                return
+            # If no results — fall through to AI chat
+            await msg.delete()
         except Exception as e:
             try:
                 await msg.edit_text(f"⚠ Ошибка: {e}")
@@ -3246,79 +2691,18 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Regular AI chat
     loop = asyncio.get_running_loop()
 
+    # Fetch live weather in thread if asked
     system_extra = ""
+    if WEATHER_RE.search(text):
+        city = extract_city(text)
+        if city:
+            system_extra = await loop.run_in_executor(None, fetch_weather, city)
+
     try:
-        answer = await loop.run_in_executor(_EXECUTOR, ask_groq, user_id, text, system_extra)
+        answer = await loop.run_in_executor(None, ask_groq, user_id, text, system_extra)
         await update.message.reply_text(answer, reply_markup=main_keyboard())
     except Exception as e:
         await update.message.reply_text(f"⚠ Ошибка: {e}")
-
-
-# ===== GIF BUILDER =====
-
-def _make_gif(frames: list, duration_ms: int, max_kb: int) -> bytes:
-    max_bytes = max_kb * 1024
-
-    def render(imgs, n_colors):
-        buf = io.BytesIO()
-        processed = []
-        for img in imgs:
-            rgba = img.convert("RGBA")
-            background = Image.new("RGB", rgba.size, (255, 255, 255))
-            background.paste(rgba, mask=rgba.split()[3])
-            q = background.quantize(colors=n_colors, method=Image.Quantize.MEDIANCUT, dither=0)
-            processed.append(q)
-        processed[0].save(
-            buf, format="GIF", save_all=True,
-            append_images=processed[1:],
-            duration=duration_ms, loop=0, optimize=True
-        )
-        return buf.getvalue()
-
-    for n_colors in [256, 128, 64, 32, 16, 8, 4, 2]:
-        data = render(frames, n_colors)
-        if len(data) <= max_bytes:
-            return data
-    return render(frames, 2)
-
-
-def build_gifs_from_zip(zip_bytes: bytes, fps: float, max_kb: int) -> tuple[bytes, list[str]]:
-    duration_ms = max(1, int(fps * 1000))
-    src = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
-
-    groups: dict[str, list[tuple[int, str, bytes]]] = {}
-    for item in src.infolist():
-        if item.is_dir():
-            continue
-        fname = os.path.basename(item.filename)
-        ext = os.path.splitext(fname)[1].lower()
-        if ext not in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}:
-            continue
-        m = re.match(r'^(.+?)_(\d+)(\.[^.]+)$', fname)
-        if m:
-            base = m.group(1)
-            idx = int(m.group(2))
-            groups.setdefault(base, []).append((idx, item.filename, src.read(item.filename)))
-
-    out_buf = io.BytesIO()
-    created: list[str] = []
-    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as dst:
-        for base, frames_list in sorted(groups.items()):
-            frames_list.sort(key=lambda x: x[0])
-            frames = []
-            for _, _, data in frames_list:
-                try:
-                    frames.append(Image.open(io.BytesIO(data)))
-                except Exception:
-                    continue
-            if len(frames) < 2:
-                continue
-            gif_bytes = _make_gif(frames, duration_ms, max_kb)
-            gif_name = f"{base}.gif"
-            dst.writestr(gif_name, gif_bytes)
-            created.append(gif_name)
-
-    return out_buf.getvalue(), created
 
 
 # ===== ZIP RENAME BY DIMENSIONS =====
@@ -3366,15 +2750,8 @@ def rename_zip_by_dimensions(zip_bytes: bytes) -> tuple[bytes, int, int]:
     return out_buf.read(), total, renamed
 
 
-
 async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle images sent as files (uncompressed documents)."""
-    user_id = update.message.from_user.id
-    _register_user(user_id)
-    if user_id == OWNER_ID and user_id in broadcast_pending:
-        broadcast_pending.discard(user_id)
-        await _do_broadcast(update, context)
-        return
     doc = update.message.document
     if not doc.mime_type or not doc.mime_type.startswith("image/"):
         return
@@ -3403,8 +2780,8 @@ async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_T
                 size_mb = len(result_bytes) / (1024 * 1024)
                 filename = "upscaled_3x.jpg"
                 fmt = "JPEG"
-            await _safe_send_doc(
-                update.message, result_bytes,
+            await update.message.reply_document(
+                document=io.BytesIO(result_bytes),
                 filename=filename,
                 caption=(
                     f"✅ Готово! Увеличено в 3x ({fmt})\n"
@@ -3423,7 +2800,7 @@ async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_T
             dl = io.BytesIO()
             await file.download_to_memory(dl)
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(_EXECUTOR, analyze_text_percentage, dl.getvalue())
+            result = await loop.run_in_executor(None, analyze_text_percentage, dl.getvalue())
             await update.message.reply_text(f"📊 {result}")
             await msg.delete()
         except Exception as e:
@@ -3454,179 +2831,42 @@ async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_T
             await msg.edit_text(f"⚠ Ошибка: {e}")
 
     else:
-        await update.message.reply_text(
-            "📷 Изображение получено!\n\n"
-            "Что я умею с фото:\n"
-            "• Подпиши «улучши фото» — увеличу в 3x\n"
-            "• Подпиши «процент текста» — определю долю текста\n"
-            "• Для сжатия — отправь ZIP-архив с картинками и подпиши «до 512кб»"
-        )
-
-
-def upload_to_filehost(data: bytes, filename: str) -> str:
-    """Upload file to one of several file hosts (tries each in order).
-    Returns a URL string. Raises RuntimeError if all fail."""
-    import requests as _req
-    import uuid as _uuid
-
-    size_mb = len(data) / (1024 * 1024)
-    errors = []
-
-    # ── 1. gofile.io — unlimited size, no account, accepts .exe ───────────
-    try:
-        srv_r = _req.get("https://api.gofile.io/servers", timeout=15)
-        srv_r.raise_for_status()
-        server = srv_r.json()["data"]["servers"][0]["name"]
-        r = _req.post(
-            f"https://{server}.gofile.io/contents/uploadfile",
-            files={"file": (filename, data, "application/octet-stream")},
-            timeout=180,
-        )
-        r.raise_for_status()
-        page = r.json().get("data", {}).get("downloadPage", "")
-        if page.startswith("https://"):
-            print(f"[upload] gofile.io OK: {page}", flush=True)
-            return f"{page}  (gofile.io · {size_mb:.1f} МБ)"
-    except Exception as e:
-        errors.append(f"gofile.io: {e}")
-
-    # ── 2. temp.sh — direct link, simple PUT ──────────────────────────────
-    try:
-        r = _req.post(
-            "https://temp.sh/upload",
-            files={"file": (filename, data, "application/octet-stream")},
-            timeout=180,
-        )
-        r.raise_for_status()
-        url = r.text.strip()
-        if url.startswith("https://"):
-            print(f"[upload] temp.sh OK: {url}", flush=True)
-            return f"{url}  (temp.sh · {size_mb:.1f} МБ)"
-    except Exception as e:
-        errors.append(f"temp.sh: {e}")
-
-    # ── 3. filebin.net — bin-page, no size limit ──────────────────────────
-    try:
-        bin_id = _uuid.uuid4().hex[:16]
-        safe_name = re.sub(r"[^\w.\-]", "_", filename)
-        r = _req.post(
-            f"https://filebin.net/{bin_id}/{safe_name}",
-            data=data,
-            headers={"Content-Type": "application/octet-stream"},
-            timeout=180,
-        )
-        if r.status_code in (200, 201):
-            page = f"https://filebin.net/{bin_id}"
-            print(f"[upload] filebin.net OK: {page}", flush=True)
-            return f"{page}  (filebin.net · {size_mb:.1f} МБ · файл: {safe_name})"
-    except Exception as e:
-        errors.append(f"filebin.net: {e}")
-
-    # ── 4. litterbox.catbox.moe — 72h, wraps non-zip in zip ───────────────
-    try:
-        if not filename.lower().endswith(".zip"):
-            _zbuf = io.BytesIO()
-            with zipfile.ZipFile(_zbuf, "w", zipfile.ZIP_DEFLATED) as _zf:
-                _zf.writestr(filename, data)
-            upload_data = _zbuf.getvalue()
-            upload_name = filename + ".zip"
-        else:
-            upload_data = data
-            upload_name = filename
-        r = _req.post(
-            "https://litterbox.catbox.moe/resources/internals/api.php",
-            data={"reqtype": "fileupload", "time": "72h"},
-            files={"fileToUpload": (upload_name, upload_data, "application/zip")},
-            timeout=180,
-        )
-        r.raise_for_status()
-        url = r.text.strip()
-        if url.startswith("https://"):
-            note = f" (внутри архива: {filename})" if upload_name != filename else ""
-            print(f"[upload] litterbox OK: {url}", flush=True)
-            return f"{url}  (litterbox · {size_mb:.1f} МБ{note})"
-    except Exception as e:
-        errors.append(f"litterbox: {e}")
-
-    raise RuntimeError(
-        "Не удалось загрузить файл ни на один хостинг.\n"
-        + "\n".join(f"• {e}" for e in errors)
-    )
-
-
-async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    _register_user(user_id)
-    if user_id == OWNER_ID and user_id in broadcast_pending:
-        broadcast_pending.discard(user_id)
-        await _do_broadcast(update, context)
-        return
-    doc = update.message.document
-    if not doc.file_name or not doc.file_name.lower().endswith(".zip"):
-        return
-
-    caption = (update.message.caption or "").strip()
-    original_name = os.path.splitext(doc.file_name)[0]
-
-    # ── Download archive (no hard size block — let API error handle it) ──────
-    msg = await update.message.reply_text("📥 Скачиваю архив…")
-    try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        dl = io.BytesIO()
-        await tg_file.download_to_memory(dl)
-        zip_bytes = dl.getvalue()
-    except Exception as e:
-        await msg.edit_text(f"⚠ Не удалось скачать архив: {e}")
-        return
-
-    loop = asyncio.get_running_loop()
-
-    # ── Route 1: GIF builder ─────────────────────────────────────────────────
-    if GIF_CMD_RE.search(caption):
-        gif_pending[user_id] = {"zip_bytes": zip_bytes, "step": "fps"}
-        await msg.edit_text(
-            "⏱ Сколько секунд на один кадр?\n"
-            "Напиши число, например: `0.5` или `1`",
-            parse_mode="Markdown"
-        )
-        return
-
-    # ── Route 2: Compress images ─────────────────────────────────────────────
-    target_bytes = parse_target_size(caption)
-    if target_bytes:
-        await msg.edit_text("🗜 Сжимаю картинки в архиве…")
+        msg = await update.message.reply_text("✂️ Удаляю фон...")
         try:
-            result_bytes, total, compressed_count = await loop.run_in_executor(
-                None, compress_zip_images, zip_bytes, target_bytes
-            )
-            if total == 0:
-                await msg.edit_text("⚠ В архиве не найдено ни одного изображения.")
-                return
-            target_kb = target_bytes / 1024
-            target_str = f"{target_kb / 1024:.1f} МБ" if target_kb >= 1024 else f"{target_kb:.0f} КБ"
-            await _safe_send_doc(
-                update.message, result_bytes,
-                filename=f"{original_name}_compressed.zip",
-                caption=(
-                    f"✅ Готово!\n"
-                    f"📸 Изображений в архиве: {total}\n"
-                    f"🗜 Сжато (превышали {target_str}): {compressed_count}\n"
-                    f"⏭ Без изменений: {total - compressed_count}"
-                ),
+            file = await context.bot.get_file(doc.file_id)
+            dl = io.BytesIO()
+            await file.download_to_memory(dl)
+            loop = asyncio.get_running_loop()
+            result_bytes = await loop.run_in_executor(None, remove_background, dl.getvalue())
+            await update.message.reply_document(
+                document=io.BytesIO(result_bytes),
+                filename="no_background.png",
+                caption="✅ Фон удалён",
             )
             await msg.delete()
         except Exception as e:
             await msg.edit_text(f"⚠ Ошибка: {e}")
+
+
+async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc.file_name or not doc.file_name.lower().endswith(".zip"):
         return
 
-    # ── Route 3: Rename images by dimensions (default) ───────────────────────
-    await msg.edit_text("📦 Переименовываю файлы в архиве…")
+    msg = await update.message.reply_text("📦 Переименовываю файлы в архиве...")
     try:
+        file = await context.bot.get_file(doc.file_id)
+        dl = io.BytesIO()
+        await file.download_to_memory(dl)
+
+        loop = asyncio.get_running_loop()
         result_bytes, total, renamed = await loop.run_in_executor(
-            None, rename_zip_by_dimensions, zip_bytes
+            None, rename_zip_by_dimensions, dl.getvalue()
         )
-        await _safe_send_doc(
-            update.message, result_bytes,
+
+        original_name = os.path.splitext(doc.file_name)[0]
+        await update.message.reply_document(
+            document=io.BytesIO(result_bytes),
             filename=f"{original_name}_renamed.zip",
             caption=f"✅ Готово: {renamed} из {total} файлов переименованы по размеру в пикселях",
         )
@@ -3637,30 +2877,6 @@ async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ===== START BOT =====
 
-async def _on_startup(application):
-    """Delete webhook before local polling mode starts."""
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        print("✅ Webhook deleted, polling mode active", flush=True)
-    except Exception as e:
-        print(f"⚠ Could not delete webhook: {e}", flush=True)
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    import traceback
-
-    err_text = "".join(traceback.format_exception(
-        type(context.error), context.error, context.error.__traceback__))
-    print(f"[ERROR] {err_text}", flush=True)
-
-    if update and hasattr(update, "message") and update.message:
-        try:
-            await update.message.reply_text("⚠ Что-то пошло не так, попробуй ещё раз.")
-        except Exception:
-            pass
-
-
-# ── Сборка приложения ──────────────────────────────────────────────────────────
 app = (
     ApplicationBuilder()
     .token(TELEGRAM_TOKEN)
@@ -3668,116 +2884,35 @@ app = (
     .read_timeout(120)
     .write_timeout(120)
     .pool_timeout(30)
-    .concurrent_updates(True)
-    .post_init(_on_startup)
     .build()
 )
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    import traceback
+    err_text = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
+    print(f"[ERROR] {err_text}", flush=True)
+    if update and hasattr(update, "message") and update.message:
+        try:
+            await update.message.reply_text("⚠ Что-то пошло не так, попробуй ещё раз.")
+        except Exception:
+            pass
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("groq", groq_cmd))
 app.add_handler(CommandHandler("music", music_cmd))
 app.add_handler(CommandHandler("reset", reset))
 app.add_handler(CommandHandler("font", font_cmd))
-app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-app.add_handler(CommandHandler("cancel", cancel_cmd))
 app.add_handler(CallbackQueryHandler(button_callback))
 app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 app.add_handler(MessageHandler(filters.VIDEO, video_handler))
 app.add_handler(MessageHandler(filters.Document.VIDEO, video_handler))
 app.add_handler(MessageHandler(filters.Document.IMAGE, image_document_handler))
+app.add_handler(MessageHandler(filters.VOICE, recognize_voice))
+app.add_handler(MessageHandler(filters.AUDIO, recognize_voice))
 app.add_handler(MessageHandler(filters.Document.FileExtension("zip"), zip_rename_handler))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 app.add_error_handler(error_handler)
 
-_app_ready = False
-_app_ready_lock = asyncio.Lock()
+print("🤖 Bot running...", flush=True)
 
-
-def _normalize_host(host: str) -> str:
-    host = (host or "").strip()
-    host = re.sub(r"^https?://", "", host).strip("/")
-    return host
-
-
-def get_webhook_url(host: str | None = None) -> str:
-    resolved_host = _normalize_host(host or WEBHOOK_HOST)
-    if not resolved_host:
-        raise RuntimeError("WEBHOOK_HOST или VERCEL_URL не задан.")
-    path = WEBHOOK_PATH if WEBHOOK_PATH.startswith("/") else f"/{WEBHOOK_PATH}"
-    return f"https://{resolved_host}{path}"
-
-
-async def ensure_app_ready() -> None:
-    global _app_ready
-    if _app_ready:
-        return
-    async with _app_ready_lock:
-        if _app_ready:
-            return
-        await app.initialize()
-        await app.start()
-        _app_ready = True
-
-
-async def process_webhook_update(update_data: dict) -> None:
-    await ensure_app_ready()
-    update = Update.de_json(update_data, app.bot)
-    await app.process_update(update)
-
-
-async def set_telegram_webhook(webhook_url: str | None = None):
-    await ensure_app_ready()
-    url = webhook_url or get_webhook_url()
-    await app.bot.set_webhook(
-        url=url,
-        drop_pending_updates=True,
-        allowed_updates=list(Update.ALL_TYPES),
-    )
-    return await app.bot.get_webhook_info()
-
-
-def _start_health_server_if_needed() -> None:
-    if not os.environ.get("PORT"):
-        return
-    import http.server as _http
-    import socketserver as _ss
-
-    class _HealthHandler(_http.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-
-        def log_message(self, *args):
-            pass
-
-    def _serve():
-        with _ss.TCPServer(("0.0.0.0", PORT), _HealthHandler) as srv:
-            print(f"✅ Health server listening on port {PORT}", flush=True)
-            srv.serve_forever()
-
-    threading.Thread(target=_serve, daemon=True).start()
-
-
-def main() -> None:
-    if os.environ.get("RUN_WEBHOOK_SERVER") == "1":
-        webhook_url = get_webhook_url()
-        print(f"🤖 Bot starting webhook server on 0.0.0.0:{PORT} → {webhook_url}", flush=True)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=WEBHOOK_PATH.lstrip("/"),
-            webhook_url=webhook_url,
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
-        return
-
-    _start_health_server_if_needed()
-    print("🤖 Bot running...", flush=True)
-    print("🔄 Polling mode", flush=True)
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
