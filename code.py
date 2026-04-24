@@ -13,7 +13,6 @@ import zipfile
 from datetime import datetime, timezone
 from openai import OpenAI
 from PIL import Image
-import instaloader
 import yt_dlp
 from duckduckgo_search import DDGS
 
@@ -25,7 +24,7 @@ from telegram.ext import (
 
 # ===== TOKENS =====
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8610501182:AAF_w5tOE446-4DaXJztk2dlh13rcX526Kk")
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY",   "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")
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "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")
 
 # ===== YOUTUBE COOKIES =====
 _YT_COOKIE_FILE: str | None = None
@@ -98,15 +97,6 @@ SOUNDCLOUD_RE = re.compile(
 DEEZER_RE = re.compile(
     r'https?://(?:www\.)?deezer\.com/(?:\w+/)?(?:track|album|playlist)/\d+'
 )
-INSTAGRAM_RE = re.compile(
-    r'https?://(?:www\.)?instagram\.com/([A-Za-z0-9_.]+)/?(?:\?[^\s]*)?(?:\s|$)',
-    re.IGNORECASE,
-)
-
-# ===== INSTAGRAM CREDENTIALS =====
-_IG_USER = os.environ.get("INSTAGRAM_USERNAME", "")
-_IG_PASS = os.environ.get("INSTAGRAM_PASSWORD", "")
-
 # Telegram bot file size limit: 50 MB
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
@@ -151,13 +141,114 @@ def build_system_prompt(extra: str = "") -> str:
 
 # ===== NAVIGATION KEYBOARD =====
 
+MENU_SECTIONS = {
+    "chat": {
+        "title": "💬 Общение",
+        "text": (
+            "💬 *Общение*\n"
+            "─────────────────\n"
+            "• Любой вопрос — отвечу развёрнуто\n"
+            "• Поддерживаю контекст разговора\n"
+            "• Помню последние 10 сообщений\n"
+            "• /reset — очистить память\n"
+            "• 🗑 Кнопка ниже — то же самое"
+        ),
+    },
+    "video": {
+        "title": "🎬 Видео",
+        "text": (
+            "🎬 *Видео*\n"
+            "─────────────────\n"
+            "• «*видео котики*» — найду на YouTube / Rutube / Dailymotion / Vimeo\n"
+            "• «*трейлер Интерстеллар*» — пришлю файлом\n"
+            "• Ссылка VK (vk.com/video…) — скачаю\n"
+            "• Ссылка YouTube / Shorts / TikTok — скачаю\n"
+            "• Кнопка *▶️ Следующий* — другой вариант"
+        ),
+    },
+    "music": {
+        "title": "🎵 Музыка",
+        "text": (
+            "🎵 *Музыка*\n"
+            "─────────────────\n"
+            "• «*музыка Imagine Dragons Believer*» — скачаю трек\n"
+            "• «*пришли музыку из фильма Интерстеллар*» — найду саундтрек\n"
+            "• Ссылка SoundCloud / VK аудио / Deezer — скачаю MP3\n"
+            "• Кнопка *🔄 Ещё* — другой вариант трека\n"
+            "• /music название — то же самое командой"
+        ),
+    },
+    "photo": {
+        "title": "🖼 Фото",
+        "text": (
+            "🖼 *Фото*\n"
+            "─────────────────\n"
+            "• Фото + «*улучши фото*» — увеличу в 3× в HD\n"
+            "• Фото + «*процент текста*» — посчитаю долю текста\n"
+            "• Фото + «*до 200кб*» — сожму до нужного размера\n"
+            "• «*покажи закат*» / «*фото машины*» — найду в сети"
+        ),
+    },
+    "zip": {
+        "title": "📦 ZIP-архивы",
+        "text": (
+            "📦 *Архивы ZIP*\n"
+            "─────────────────\n"
+            "• ZIP с картинками — переименую по размеру (1920x1080.jpg)\n"
+            "• ZIP + «*до 512кб*» — сожму превышающие лимит\n"
+            "• ZIP + «*собери гиф*» — соберу GIF из групп картинок"
+        ),
+    },
+    "fonts": {
+        "title": "🔤 Шрифты",
+        "text": (
+            "🔤 *Шрифты*\n"
+            "─────────────────\n"
+            "• «*шрифт Roboto*» — найду TTF с выбором начертания\n"
+            "• /font Roboto — то же самое командой\n"
+            "• Доступны: Regular, Bold, Italic, Light, SemiBold, Thin, Black и др.\n"
+            "• Кнопка *📦 Все начертания* — ZIP со всеми стилями"
+        ),
+    },
+}
+
+MENU_ORDER = ["chat", "video", "music", "photo", "zip", "fonts"]
+
+
+def main_menu_keyboard():
+    rows = []
+    for i in range(0, len(MENU_ORDER), 2):
+        chunk = MENU_ORDER[i:i + 2]
+        rows.append([
+            InlineKeyboardButton(MENU_SECTIONS[k]["title"], callback_data=f"menu:{k}")
+            for k in chunk
+        ])
+    rows.append([InlineKeyboardButton("🗑 Очистить память", callback_data="reset_memory")])
+    return InlineKeyboardMarkup(rows)
+
+
+def section_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:home")],
+    ])
+
+
 def main_keyboard():
-    keyboard = [
-        [
-            InlineKeyboardButton("🗑 Очистить память", callback_data="reset_memory"),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Меню функций", callback_data="menu:home")],
+        [InlineKeyboardButton("🗑 Очистить память", callback_data="reset_memory")],
+    ])
+
+
+MAIN_MENU_TEXT = (
+    "🤖 *Бот — всё в одном*\n"
+    "─────────────────\n"
+    "Выбери раздел, чтобы увидеть подробности.\n"
+    "Можно сразу писать в чат — я пойму запрос.\n\n"
+    "📂 *Разделы:*\n"
+    "💬 Общение  ·  🎬 Видео  ·  🎵 Музыка\n"
+    "🖼 Фото  ·  📦 ZIP  ·  🔤 Шрифты"
+)
 
 
 # ===== GROQ FUNCTION =====
@@ -2350,51 +2441,18 @@ async def music_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== COMMANDS =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
     await update.message.reply_text(
-        "🤖 *Бот* — пиши что угодно.\n"
-        "\n"
-        "💬 *Общение*\n"
-        "• Любой вопрос — отвечу развёрнуто\n"
-        "• Поддерживаю контекст разговора\n"
-        "• /reset — очистить память\n"
-        "\n"
-        "🎬 *Видео*\n"
-        "• *«видео котики»* — скачаю с YouTube / Rutube / Dailymotion / Vimeo\n"
-        "• *«трейлер Интерстеллар»* — найду и пришлю файлом\n"
-        "• Ссылка VK (vk.com/video...) — скачаю видео\n"
-        "• Кнопка *▶️ Следующий* — попробую другой вариант\n"
-        "\n"
-        "🎵 *Музыка*\n"
-        "• *«музыка Imagine Dragons Believer»* — скачаю трек\n"
-        "• *«Пришли музыку из фильма Интерстеллар»* — найду саундтрек\n"
-        "• Ссылка SoundCloud / VK аудио / Deezer — скачаю MP3\n"
-        "• Кнопка *🔄 Ещё* — попробую другой вариант трека\n"
-        "\n"
-        "🖼 *Фото*\n"
-        "• Фото + *«улучши фото»* — увеличу в 3× в высоком качестве\n"
-        "• Фото + *«процент текста»* — покажу долю текста на изображении\n"
-        "• Фото + *«до 200кб»* — сожму до нужного размера\n"
-        "• *«покажи закат»* / *«фото машины»* — найду и пришлю фото из сети\n"
-        "\n"
-        "📦 *Архивы ZIP*\n"
-        "• ZIP с картинками — переименую файлы по размеру (напр. 1920x1080.jpg)\n"
-        "• ZIP + *«до 512кб»* — сожму картинки, превышающие указанный размер\n"
-        "• ZIP + *«собери гиф»* — соберу GIF из групп картинок\n"
-        "\n"
-        "📸 *Instagram*\n"
-        "• Ссылка instagram.com/username — соберу всех подписчиков и пришлю .txt файлом\n"
-        "\n"
-        "⚙ *Патч EXE (без прав администратора)*\n"
-        "• Файл .exe (до 20 МБ) — уберу требование прав администратора и пришлю обратно\n"
-        "• Файл .exe (больше 20 МБ) — загрузи на litterbox.catbox.moe или filebin.net, пришли ссылку — патчу и пришлю новую\n"
-        "• Файл > 50 МБ после патча — автоматически загружу на файлохостинг\n"
-        "\n"
-        "🔤 *Шрифты*\n"
-        "• *«шрифт Roboto»* — найду и пришлю TTF с выбором начертания\n"
-        "• /font Roboto — то же самое через команду",
+        MAIN_MENU_TEXT,
         parse_mode="Markdown",
-        reply_markup=main_keyboard()
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        MAIN_MENU_TEXT,
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -2467,7 +2525,36 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "reset_memory":
         with _memory_lock:
             user_memory[user_id] = []
-        await query.message.reply_text("🗑 Память очищена")
+        await query.message.reply_text("🗑 Память очищена", reply_markup=main_keyboard())
+
+    elif query.data.startswith("menu:"):
+        key = query.data.split(":", 1)[1]
+        if key == "home":
+            try:
+                await query.message.edit_text(
+                    MAIN_MENU_TEXT,
+                    parse_mode="Markdown",
+                    reply_markup=main_menu_keyboard(),
+                )
+            except Exception:
+                await query.message.reply_text(
+                    MAIN_MENU_TEXT,
+                    parse_mode="Markdown",
+                    reply_markup=main_menu_keyboard(),
+                )
+        elif key in MENU_SECTIONS:
+            try:
+                await query.message.edit_text(
+                    MENU_SECTIONS[key]["text"],
+                    parse_mode="Markdown",
+                    reply_markup=section_keyboard(),
+                )
+            except Exception:
+                await query.message.reply_text(
+                    MENU_SECTIONS[key]["text"],
+                    parse_mode="Markdown",
+                    reply_markup=section_keyboard(),
+                )
 
     elif query.data == "next_video":
         state = video_search_state.get(user_id)
@@ -2767,94 +2854,6 @@ async def _send_next_video(reply_video_fn, reply_doc_fn, reply_text_fn, user_id:
         return
 
 
-# ===== INSTAGRAM FOLLOWERS SCRAPER =====
-
-# Slugs that are not real user pages (Instagram service paths)
-_IG_RESERVED = {
-    "p", "reel", "stories", "explore", "tv", "reels",
-    "accounts", "about", "privacy", "legal", "help",
-    "ar", "en", "ru", "de", "fr", "es", "it", "pt",
-    "direct", "oauth", "api", "web", "graphql",
-}
-
-
-def scrape_instagram_followers(
-    target_username: str,
-    progress_cb=None,
-) -> tuple[list[str], str, int]:
-    """
-    Login to Instagram, scrape all followers of `target_username`.
-    Returns (follower_usernames, display_name, total_count).
-    `progress_cb(done: int)` is called every 50 fetched followers.
-    Requires INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD env vars.
-    """
-    ig_user = os.environ.get("INSTAGRAM_USERNAME", "")
-    ig_pass = os.environ.get("INSTAGRAM_PASSWORD", "")
-
-    if not ig_user or not ig_pass:
-        raise RuntimeError(
-            "INSTAGRAM_CREDENTIALS_MISSING"
-        )
-
-    L = instaloader.Instaloader(
-        quiet=True,
-        sleep=True,
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-        compress_json=False,
-    )
-
-    ig_session_id = os.environ.get("INSTAGRAM_SESSION_ID", "")
-
-    if ig_session_id:
-        try:
-            import http.cookiejar
-            L.context._session.cookies.set(
-                "sessionid", ig_session_id, domain=".instagram.com"
-            )
-            L.context.username = ig_user
-        except Exception as e:
-            raise RuntimeError(f"INSTAGRAM_SESSION_ERROR: {e}")
-    else:
-        try:
-            L.login(ig_user, ig_pass)
-        except instaloader.exceptions.BadCredentialsException:
-            raise RuntimeError("INSTAGRAM_BAD_CREDENTIALS")
-        except instaloader.exceptions.TwoFactorAuthRequiredException:
-            raise RuntimeError("INSTAGRAM_2FA_REQUIRED")
-        except Exception as e:
-            raise RuntimeError(f"INSTAGRAM_LOGIN_ERROR: {e}")
-
-    try:
-        profile = instaloader.Profile.from_username(L.context, target_username)
-    except instaloader.exceptions.ProfileNotExistsException:
-        raise RuntimeError(f"Профиль @{target_username} не существует.")
-    except Exception as e:
-        raise RuntimeError(f"Не удалось открыть профиль: {e}")
-
-    display_name = profile.full_name or target_username
-    total_count = profile.followers
-
-    usernames: list[str] = []
-    try:
-        for follower in profile.get_followers():
-            usernames.append(follower.username)
-            if progress_cb and len(usernames) % 50 == 0:
-                progress_cb(len(usernames))
-    except instaloader.exceptions.LoginRequiredException:
-        if not usernames:
-            raise RuntimeError(
-                "Instagram требует вход для просмотра подписчиков этого аккаунта.\n"
-                "Проверь настройки аккаунта — возможно, он закрытый."
-            )
-
-    return usernames, display_name, total_count
-
-
 # ===== AUTO-UPLOAD HELPERS =====
 
 _TG_SEND_LIMIT = 50 * 1024 * 1024  # 50 MB — Telegram bot send limit
@@ -3088,122 +3087,6 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await msg.edit_text(f"⚠ Ошибка: {e}")
         return
-
-    # ── Instagram: parse followers from a profile link ─────────────────────
-    ig_match = INSTAGRAM_RE.search(text)
-    if ig_match:
-        raw_slug = ig_match.group(1).lower().strip("/")
-        if raw_slug not in _IG_RESERVED:
-            target_user = raw_slug
-            loop = asyncio.get_running_loop()
-            ig_user_cfg = os.environ.get("INSTAGRAM_USERNAME", "")
-            ig_pass_cfg = os.environ.get("INSTAGRAM_PASSWORD", "")
-
-            if not ig_user_cfg or not ig_pass_cfg:
-                await update.message.reply_text(
-                    "⚙️ Для парсинга подписчиков Instagram нужен аккаунт-парсер.\n\n"
-                    "Настрой переменные окружения:\n"
-                    "• `INSTAGRAM_USERNAME` — логин аккаунта\n"
-                    "• `INSTAGRAM_PASSWORD` — пароль аккаунта\n\n"
-                    "⚠️ Используй отдельный аккаунт, не основной.",
-                    parse_mode="Markdown",
-                )
-                return
-
-            status = await update.message.reply_text(
-                f"📸 Подключаюсь к Instagram и собираю подписчиков @{target_user}…\n"
-                "⏳ Это может занять несколько минут."
-            )
-
-            last_progress = [0]
-
-            def _progress(done: int):
-                last_progress[0] = done
-
-            async def _update_progress():
-                while True:
-                    await asyncio.sleep(15)
-                    done = last_progress[0]
-                    if done > 0:
-                        try:
-                            await status.edit_text(
-                                f"📸 Собираю подписчиков @{target_user}…\n"
-                                f"✅ Собрано: {done} логинов"
-                            )
-                        except Exception:
-                            pass
-
-            progress_task = asyncio.create_task(_update_progress())
-
-            try:
-                usernames, display_name, total = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        _EXECUTOR,
-                        scrape_instagram_followers,
-                        target_user,
-                        _progress,
-                    ),
-                    timeout=None,
-                )
-            except asyncio.TimeoutError:
-                progress_task.cancel()
-                await status.edit_text("⏱ Превышено время ожидания. Попробуй позже.")
-                return
-            except RuntimeError as e:
-                progress_task.cancel()
-                err = str(e)
-                if "INSTAGRAM_CREDENTIALS_MISSING" in err:
-                    await status.edit_text("⚙️ Не заданы учётные данные Instagram.")
-                elif "INSTAGRAM_BAD_CREDENTIALS" in err:
-                    await status.edit_text("❌ Неверный логин или пароль Instagram-аккаунта парсера.")
-                elif "INSTAGRAM_2FA_REQUIRED" in err:
-                    await status.edit_text("❌ На аккаунте парсера включена двухфакторная аутентификация — отключи её.")
-                else:
-                    await status.edit_text(f"⚠ Ошибка: {err[:300]}")
-                return
-            except Exception as e:
-                progress_task.cancel()
-                await status.edit_text(f"⚠ Неожиданная ошибка: {e!s:.200}")
-                return
-
-            progress_task.cancel()
-
-            if not usernames:
-                await status.edit_text(
-                    f"😔 Не удалось получить подписчиков @{target_user}.\n"
-                    "Возможно, аккаунт закрытый или Instagram заблокировал запросы."
-                )
-                return
-
-            # Build .txt file
-            txt_content = "\n".join(usernames).encode("utf-8")
-            fname = f"followers_{target_user}.txt"
-            caption = (
-                f"📸 Подписчики @{target_user}"
-                + (f" ({display_name})" if display_name != target_user else "")
-                + f"\n👥 Всего подписчиков: {total:,}\n"
-                f"📋 Собрано логинов: {len(usernames):,}"
-            )
-            try:
-                await status.edit_text("📤 Отправляю файл…")
-                await update.message.reply_document(
-                    document=io.BytesIO(txt_content),
-                    filename=fname,
-                    caption=caption,
-                )
-                await status.delete()
-            except Exception as e:
-                await status.edit_text(f"⚠ Не удалось отправить файл: {e}")
-            return
-
-    # ── litterbox / filebin.net link → patch .exe ────────────────────────────
-    fh_match = FILEHOST_RE.search(text)
-    if fh_match:
-        url = fh_match.group(0)
-        if any(url.lower().endswith(ext) for ext in (".exe", ".bin", ".msi", ".zip")):
-            await _process_exe(update, context, url.split("/")[-1],
-                               source="filehost", filehost_url=url)
-            return
 
     # Check for VK / SoundCloud / Deezer audio links
     vk_match = VK_RE.search(text)
@@ -3669,17 +3552,6 @@ async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
 
 
-FILEHOST_RE = re.compile(
-    r'https?://(?:'
-    r'files\.catbox\.moe/\S+'
-    r'|litter\.catbox\.moe/\S+'
-    r'|0x0\.st/\S+'
-    r'|filebin\.net/\S+'
-    r')',
-    re.IGNORECASE,
-)
-
-
 def upload_to_filehost(data: bytes, filename: str) -> str:
     """Upload file to one of several file hosts (tries each in order).
     Returns a URL string. Raises RuntimeError if all fail."""
@@ -3689,7 +3561,7 @@ def upload_to_filehost(data: bytes, filename: str) -> str:
     size_mb = len(data) / (1024 * 1024)
     errors = []
 
-    # ── 1. gofile.io — unlimited size, no account, accepts .exe ───────────
+    # ── 1. gofile.io — unlimited size, no account ─────────────────────────
     try:
         srv_r = _req.get("https://api.gofile.io/servers", timeout=15)
         srv_r.raise_for_status()
@@ -3771,247 +3643,6 @@ def upload_to_filehost(data: bytes, filename: str) -> str:
     )
 
 
-def download_from_filehost(url: str) -> tuple[bytes, str]:
-    """Download a file from litterbox / filebin.net / other filehost. Returns (bytes, filename)."""
-    import requests as _req
-    headers = {"Accept": "application/octet-stream"}
-    r = _req.get(url, timeout=120, stream=True, headers=headers)
-    r.raise_for_status()
-    data = r.content
-    filename = url.rstrip("/").split("/")[-1] or "file.exe"
-    return data, filename
-
-
-def extract_exe_contents(exe_bytes: bytes, filename: str) -> tuple[bytes, int, list[str]]:
-    """
-    Extract files from a .exe installer (NSIS, Inno Setup, SFX, etc.) using 7z.
-    Returns (zip_bytes, file_count, file_list).
-    """
-    import subprocess
-    with tempfile.TemporaryDirectory() as tmpdir:
-        exe_path = os.path.join(tmpdir, filename)
-        out_dir = os.path.join(tmpdir, "extracted")
-        os.makedirs(out_dir, exist_ok=True)
-        with open(exe_path, "wb") as f:
-            f.write(exe_bytes)
-
-        result = subprocess.run(
-            ["7z", "x", exe_path, f"-o{out_dir}", "-y", "-bd"],
-            capture_output=True, text=True, timeout=60
-        )
-
-        extracted = []
-        for root, dirs, files in os.walk(out_dir):
-            for fname in files:
-                extracted.append(os.path.join(root, fname))
-
-        if not extracted:
-            err = result.stdout[-500:] + result.stderr[-500:]
-            raise RuntimeError(f"Не удалось извлечь файлы.\n7z вывод:\n{err[:400]}")
-
-        zip_buf = io.BytesIO()
-        base_name = os.path.splitext(filename)[0]
-        file_list = []
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for fpath in extracted:
-                arcname = os.path.relpath(fpath, out_dir)
-                file_list.append(arcname)
-                zf.write(fpath, arcname)
-
-        zip_bytes = zip_buf.getvalue()
-        return zip_bytes, len(extracted), file_list
-
-
-def _patch_exe_remove_admin(data: bytes) -> tuple[bytes, bool]:
-    """Remove requireAdministrator from PE manifest via same-length binary replacement.
-    Returns (patched_bytes, was_patched)."""
-    # UTF-8 variants (double-quote and single-quote)
-    patterns = [
-        (b'level="requireAdministrator"', b'level="asInvoker"           '),
-        (b"level='requireAdministrator'", b"level='asInvoker'           "),
-    ]
-    # UTF-16LE variants
-    for find_s, repl_s in list(patterns):
-        patterns.append((
-            find_s.decode().encode("utf-16-le"),
-            repl_s.decode().encode("utf-16-le"),
-        ))
-
-    patched = data
-    was_patched = False
-    for find, repl in patterns:
-        assert len(find) == len(repl), f"length mismatch: {len(find)} vs {len(repl)}"
-        if find in patched:
-            patched = patched.replace(find, repl)
-            was_patched = True
-    return patched, was_patched
-
-
-def _patch_all_in_zip(data: bytes):
-    """Patch all .exe/.msi/.bin files in a ZIP archive in-place.
-    Returns (patched_zip_bytes, patched_count, total_exe_count)."""
-    in_zf = zipfile.ZipFile(io.BytesIO(data), "r")
-    names = in_zf.namelist()
-    if not names:
-        raise RuntimeError("ZIP-архив пустой.")
-    exe_names = [n for n in names if n.lower().endswith((".exe", ".msi", ".bin"))]
-    out_buf = io.BytesIO()
-    patched_count = 0
-    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as out_zf:
-        for name in names:
-            entry_bytes = in_zf.read(name)
-            if name.lower().endswith((".exe", ".msi", ".bin")):
-                entry_bytes, was = _patch_exe_remove_admin(entry_bytes)
-                if was:
-                    patched_count += 1
-            out_zf.writestr(name, entry_bytes)
-    in_zf.close()
-    return out_buf.getvalue(), patched_count, len(exe_names)
-
-
-async def exe_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc.file_name or not doc.file_name.lower().endswith(".exe"):
-        return
-
-    await _process_exe(update, context, doc.file_name,
-                       source="telegram", file_id=doc.file_id)
-
-
-async def _process_exe(update, context, filename: str,
-                       source: str, file_id: str = None,
-                       filehost_url: str = None):
-    """Download EXE, patch manifest to remove admin rights, send back or upload."""
-    msg = await update.message.reply_text(
-        f"📥 Получил *{filename}*\n🔧 Убираю требование прав администратора…",
-        parse_mode="Markdown"
-    )
-    try:
-        loop = asyncio.get_running_loop()
-
-        # ── Download ──────────────────────────────────────────────────────────
-        if source == "telegram":
-            file = await context.bot.get_file(file_id)
-            dl = io.BytesIO()
-            await file.download_to_memory(dl)
-            exe_bytes = dl.getvalue()
-        else:
-            await msg.edit_text(f"📥 Скачиваю *{filename}*…", parse_mode="Markdown")
-            exe_bytes, filename = await loop.run_in_executor(
-                _EXECUTOR, download_from_filehost, filehost_url
-            )
-            # Если прислали ZIP — патчим всё внутри и возвращаем новый ZIP
-            if filename.lower().endswith(".zip"):
-                await msg.edit_text(
-                    f"📦 Распаковываю *{filename}*, патчу exe…", parse_mode="Markdown"
-                )
-
-                def _patch_all_in_zip(data: bytes):
-                    in_zf = zipfile.ZipFile(io.BytesIO(data), "r")
-                    names = in_zf.namelist()
-                    if not names:
-                        raise RuntimeError("ZIP-архив пустой.")
-                    exe_names = [n for n in names
-                                 if n.lower().endswith((".exe", ".msi", ".bin"))]
-                    if not exe_names:
-                        raise RuntimeError("В ZIP-архиве не найдено ни одного .exe файла.")
-                    out_buf = io.BytesIO()
-                    patched_count = 0
-                    with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as out_zf:
-                        for name in names:
-                            entry_bytes = in_zf.read(name)
-                            if name.lower().endswith((".exe", ".msi", ".bin")):
-                                entry_bytes, was = _patch_exe_remove_admin(entry_bytes)
-                                if was:
-                                    patched_count += 1
-                            out_zf.writestr(name, entry_bytes)
-                    in_zf.close()
-                    return out_buf.getvalue(), patched_count, len(exe_names)
-
-                zip_out, patched_count, total_exe = await loop.run_in_executor(
-                    _EXECUTOR, _patch_all_in_zip, exe_bytes
-                )
-
-                # Имя выходного архива
-                base = filename[:-4] if filename.lower().endswith(".zip") else filename
-                out_zip_name = base + "_patched.zip"
-                patch_note = (
-                    f"✅ Пропатчено {patched_count} из {total_exe} exe-файлов — "
-                    f"права администратора убраны."
-                    if patched_count
-                    else "ℹ Ни один exe в архиве не требовал прав администратора."
-                )
-
-                _TELEGRAM_SEND_LIMIT = 50 * 1024 * 1024
-                size_mb = len(zip_out) / (1024 * 1024)
-                if len(zip_out) <= _TELEGRAM_SEND_LIMIT:
-                    await msg.edit_text("📤 Отправляю архив…")
-                    await update.message.reply_document(
-                        document=io.BytesIO(zip_out),
-                        filename=out_zip_name,
-                        caption=f"{patch_note}\n📦 {out_zip_name} · {size_mb:.1f} МБ",
-                    )
-                else:
-                    await msg.edit_text(f"📤 Архив {size_mb:.1f} МБ — загружаю на файлохостинг…")
-                    dl_link = await loop.run_in_executor(
-                        _EXECUTOR, upload_to_filehost, zip_out, out_zip_name
-                    )
-                    await update.message.reply_text(
-                        f"{patch_note}\n\n📦 Скачать: {dl_link}\n📁 Размер: {size_mb:.1f} МБ"
-                    )
-                await msg.delete()
-                return
-
-            elif not filename.lower().endswith((".exe", ".msi", ".bin")):
-                await msg.edit_text(
-                    "⚠ Файл не является .exe — загрузи правильный файл и попробуй снова."
-                )
-                return
-
-        # ── Patch manifest ────────────────────────────────────────────────────
-        await msg.edit_text(f"🔧 Патчу *{filename}*…", parse_mode="Markdown")
-        patched_bytes, was_patched = await loop.run_in_executor(
-            _EXECUTOR, _patch_exe_remove_admin, exe_bytes
-        )
-
-        patch_note = (
-            "✅ Требование прав администратора убрано."
-            if was_patched
-            else "ℹ Файл не требовал прав администратора (манифест не изменён)."
-        )
-
-        # ── Send or upload ────────────────────────────────────────────────────
-        _TELEGRAM_SEND_LIMIT = 50 * 1024 * 1024
-        size_mb = len(patched_bytes) / (1024 * 1024)
-
-        if len(patched_bytes) <= _TELEGRAM_SEND_LIMIT:
-            await msg.edit_text("📤 Отправляю файл…")
-            await update.message.reply_document(
-                document=io.BytesIO(patched_bytes),
-                filename=filename,
-                caption=f"{patch_note}\n📦 {filename} · {size_mb:.1f} МБ",
-            )
-            await msg.delete()
-        else:
-            await msg.edit_text(f"📤 Файл {size_mb:.1f} МБ — загружаю на файлохостинг…")
-            dl_link = await loop.run_in_executor(
-                _EXECUTOR, upload_to_filehost, patched_bytes, filename
-            )
-            await update.message.reply_text(
-                f"{patch_note}\n\n"
-                f"📦 Скачать: {dl_link}\n"
-                f"📁 Размер: {size_mb:.1f} МБ"
-            )
-            await msg.delete()
-
-    except asyncio.TimeoutError:
-        await msg.edit_text("⏱ Превышено время ожидания.")
-    except RuntimeError as e:
-        await msg.edit_text(f"⚠ {e}")
-    except Exception as e:
-        await msg.edit_text(f"⚠ Ошибка: {e!s:.300}")
-
-
 async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc.file_name or not doc.file_name.lower().endswith(".zip"):
@@ -4033,9 +3664,8 @@ async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         size_mb = (doc.file_size or 0) / (1024 * 1024)
         if "too big" in err_str.lower() or "file is too big" in err_str.lower() or size_mb > 20:
             await msg.edit_text(
-                f"⚠ Архив {size_mb:.0f} МБ — Telegram не позволяет ботам скачивать файлы >20 МБ.\n\n"
-                "Загрузи архив на gofile.io или filebin.net и пришли ссылку — "
-                "я всё равно его пропатчу."
+                f"⚠ Архив {size_mb:.0f} МБ — Telegram не позволяет ботам скачивать файлы >20 МБ.\n"
+                "Уменьши архив и пришли заново."
             )
         else:
             await msg.edit_text(f"⚠ Не удалось скачать архив: {e}")
@@ -4081,49 +3711,7 @@ async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await msg.edit_text(f"⚠ Ошибка: {e}")
         return
 
-    # ── Route 3: Patch EXE — auto-detect or explicit caption ─────────────────
-    _PATCH_RE = re.compile(
-        r'\b(патч|patch|убери|убрать|сними|снять|удали|удалить).*(?:права|админ|administrator|admin|uac)\b'
-        r'|(?:права|админ|administrator|admin|uac).*\b(убери|убрать|сними|снять|удали|patch)\b',
-        re.IGNORECASE,
-    )
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as _zf:
-            exe_files_in_zip = [n for n in _zf.namelist()
-                                if n.lower().endswith((".exe", ".msi", ".bin"))]
-    except Exception:
-        exe_files_in_zip = []
-
-    if exe_files_in_zip or _PATCH_RE.search(caption):
-        if not exe_files_in_zip:
-            await msg.edit_text("⚠ В архиве не найдено ни одного .exe файла.")
-            return
-        await msg.edit_text(
-            f"🔧 Найдено {len(exe_files_in_zip)} exe-файл(ов). Патчу — убираю права администратора…"
-        )
-        try:
-            zip_out, patched_count, total_exe = await loop.run_in_executor(
-                _EXECUTOR, _patch_all_in_zip, zip_bytes
-            )
-        except Exception as e:
-            await msg.edit_text(f"⚠ Ошибка при патче: {e}")
-            return
-
-        patch_note = (
-            f"✅ Пропатчено {patched_count} из {total_exe} exe-файлов — права администратора убраны."
-            if patched_count
-            else "ℹ Ни один exe в архиве не требовал прав администратора."
-        )
-        out_zip_name = f"{original_name}_patched.zip"
-        await _safe_send_doc(
-            update.message, zip_out,
-            filename=out_zip_name,
-            caption=f"{patch_note}\n📦 {out_zip_name} · {len(zip_out) / (1024*1024):.1f} МБ",
-        )
-        await msg.delete()
-        return
-
-    # ── Route 4: Rename images by dimensions (default) ───────────────────────
+    # ── Route 3: Rename images by dimensions (default) ───────────────────────
     await msg.edit_text("📦 Переименовываю файлы в архиве…")
     try:
         result_bytes, total, renamed = await loop.run_in_executor(
@@ -4142,8 +3730,15 @@ async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ===== START BOT =====
 
 async def _on_startup(application):
-    """Delete any active webhook before switching to polling mode. Retries until confirmed."""
+    """In polling mode: drop any active webhook. In webhook mode: start keep-alive task."""
     import asyncio as _asyncio
+    if os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
+        # In webhook mode, run_webhook will set the webhook itself.
+        # Spawn keep-alive task so Render free instance never sleeps.
+        _asyncio.create_task(_keep_alive_loop())
+        print("💓 Keep-alive task started", flush=True)
+        return
+
     for attempt in range(5):
         try:
             await application.bot.delete_webhook(drop_pending_updates=True)
@@ -4155,6 +3750,48 @@ async def _on_startup(application):
             print(f"[startup] delete_webhook attempt {attempt+1}: {e}", flush=True)
         await _asyncio.sleep(2)
     print("⚠ Could not confirm webhook deletion after 5 attempts", flush=True)
+
+
+async def _keep_alive_loop():
+    """Self-ping the Render service every ~10 minutes to prevent free-tier sleep.
+    Render free web services go to sleep after ~15 minutes without HTTP traffic.
+    Pinging our own /health endpoint keeps the process awake 24/7 so the bot
+    answers instantly at any time of day.
+    """
+    import asyncio as _asyncio
+    host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
+    if not host:
+        return
+    ping_url = f"https://{host}/health"
+    interval = int(os.environ.get("KEEPALIVE_INTERVAL", "600"))  # 10 min default
+
+    try:
+        import aiohttp  # type: ignore
+        use_aiohttp = True
+    except Exception:
+        use_aiohttp = False
+
+    await _asyncio.sleep(30)  # let the server come up first
+    while True:
+        try:
+            if use_aiohttp:
+                import aiohttp  # type: ignore
+                timeout = aiohttp.ClientTimeout(total=20)
+                async with aiohttp.ClientSession(timeout=timeout) as sess:
+                    async with sess.get(ping_url) as resp:
+                        print(f"💓 keep-alive ping {ping_url} -> {resp.status}", flush=True)
+            else:
+                def _ping():
+                    try:
+                        with urllib.request.urlopen(ping_url, timeout=20) as r:
+                            return r.status
+                    except Exception as e:
+                        return f"err:{e}"
+                status = await _asyncio.get_running_loop().run_in_executor(_EXECUTOR, _ping)
+                print(f"💓 keep-alive ping {ping_url} -> {status}", flush=True)
+        except Exception as e:
+            print(f"[keep-alive] error: {e}", flush=True)
+        await _asyncio.sleep(interval)
 
 app = (
     ApplicationBuilder()
@@ -4196,6 +3833,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("menu", menu_cmd))
+app.add_handler(CommandHandler("help", menu_cmd))
 app.add_handler(CommandHandler("groq", groq_cmd))
 app.add_handler(CommandHandler("music", music_cmd))
 app.add_handler(CommandHandler("reset", reset))
@@ -4206,7 +3845,6 @@ app.add_handler(MessageHandler(filters.VIDEO, video_handler))
 app.add_handler(MessageHandler(filters.Document.VIDEO, video_handler))
 app.add_handler(MessageHandler(filters.Document.IMAGE, image_document_handler))
 app.add_handler(MessageHandler(filters.Document.FileExtension("zip"), zip_rename_handler))
-app.add_handler(MessageHandler(filters.Document.FileExtension("exe"), exe_handler))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 app.add_error_handler(error_handler)
 
