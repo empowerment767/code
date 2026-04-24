@@ -1,4 +1,3 @@
-import asyncio
 import concurrent.futures
 import http.cookiejar as _cookiejar
 import io
