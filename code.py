@@ -18,13 +18,21 @@ from duckduckgo_search import DDGS
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 
 # ===== TOKENS =====
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8610501182:AAF_w5tOE446-4DaXJztk2dlh13rcX526Kk")
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "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")
+TELEGRAM_TOKEN = os.environ.get(
+    "TELEGRAM_TOKEN", "8610501182:AAF_w5tOE446-4DaXJztk2dlh13rcX526Kk"
+)
+GROQ_API_KEY = os.environ.get(
+    "GROQ_API_KEY", "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"
+)
 
 # ===== YOUTUBE COOKIES =====
 _YT_COOKIE_FILE: str | None = None
@@ -37,10 +45,7 @@ if _yt_cookies_raw.strip():
     print(f"✅ YouTube cookies loaded ({len(_yt_cookies_raw)} bytes)", flush=True)
 
 # ===== GROQ CLIENT =====
-groq_client = OpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
-)
+groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
@@ -49,53 +54,53 @@ user_memory = {}
 _memory_lock = threading.Lock()
 _user_locks: dict[int, asyncio.Lock] = {}
 
+
 def _get_user_lock(user_id: int) -> asyncio.Lock:
     if user_id not in _user_locks:
         _user_locks[user_id] = asyncio.Lock()
     return _user_locks[user_id]
+
 
 # ===== FONT STATE =====
 font_pending = {}  # user_id -> font_name
 
 # ===== GIF BUILD STATE =====
 gif_pending = {}  # user_id -> {"zip_bytes": bytes, "step": "fps"} | {..., "step": "maxsize", "fps": float}
-GIF_CMD_RE = re.compile(r'собери\s*гиф', re.IGNORECASE)
+GIF_CMD_RE = re.compile(r"собери\s*гиф", re.IGNORECASE)
 
 
 STYLE_ALIASES = {
-    "regular":        "Regular",
-    "обычный":        "Regular",
-    "normal":         "Regular",
-    "bold":           "Bold",
-    "жирный":         "Bold",
-    "italic":         "Italic",
-    "курсив":         "Italic",
-    "наклонный":      "Italic",
-    "bolditalic":     "BoldItalic",
-    "bold italic":    "BoldItalic",
-    "жирный курсив":  "BoldItalic",
-    "light":          "Light",
-    "светлый":        "Light",
-    "thin":           "Thin",
-    "тонкий":         "Thin",
-    "medium":         "Medium",
-    "медиум":         "Medium",
-    "semibold":       "SemiBold",
-    "полужирный":     "SemiBold",
-    "extrabold":      "ExtraBold",
-    "black":          "Black",
-    "extralight":     "ExtraLight",
+    "regular": "Regular",
+    "обычный": "Regular",
+    "normal": "Regular",
+    "bold": "Bold",
+    "жирный": "Bold",
+    "italic": "Italic",
+    "курсив": "Italic",
+    "наклонный": "Italic",
+    "bolditalic": "BoldItalic",
+    "bold italic": "BoldItalic",
+    "жирный курсив": "BoldItalic",
+    "light": "Light",
+    "светлый": "Light",
+    "thin": "Thin",
+    "тонкий": "Thin",
+    "medium": "Medium",
+    "медиум": "Medium",
+    "semibold": "SemiBold",
+    "полужирный": "SemiBold",
+    "extrabold": "ExtraBold",
+    "black": "Black",
+    "extralight": "ExtraLight",
 }
 
 # ===== URL PATTERNS =====
 VK_RE = re.compile(
-    r'https?://(?:www\.)?vk\.com/(?:video[\-\d_]+|music/album/[\w\-]+|wall[\-\d_]+|clip[\-\d_]+)'
+    r"https?://(?:www\.)?vk\.com/(?:video[\-\d_]+|music/album/[\w\-]+|wall[\-\d_]+|clip[\-\d_]+)"
 )
-SOUNDCLOUD_RE = re.compile(
-    r'https?://(?:www\.)?soundcloud\.com/[\w\-]+/[\w\-]+'
-)
+SOUNDCLOUD_RE = re.compile(r"https?://(?:www\.)?soundcloud\.com/[\w\-]+/[\w\-]+")
 DEEZER_RE = re.compile(
-    r'https?://(?:www\.)?deezer\.com/(?:\w+/)?(?:track|album|playlist)/\d+'
+    r"https?://(?:www\.)?deezer\.com/(?:\w+/)?(?:track|album|playlist)/\d+"
 )
 # Telegram bot file size limit: 50 MB
 MAX_FILE_SIZE = 50 * 1024 * 1024
@@ -112,14 +117,15 @@ def get_current_datetime() -> str:
 
 
 _CJK_RE = re.compile(
-    r'[\u2E80-\u2EFF\u2F00-\u2FDF\u3000-\u303F\u3040-\u309F\u30A0-\u30FF'
-    r'\u3100-\u312F\u3200-\u32FF\u3300-\u33FF\u3400-\u4DBF\u4E00-\u9FFF'
-    r'\uF900-\uFAFF\uFE30-\uFE4F\U00020000-\U0002A6DF\U0002A700-\U0002CEAF]'
+    r"[\u2E80-\u2EFF\u2F00-\u2FDF\u3000-\u303F\u3040-\u309F\u30A0-\u30FF"
+    r"\u3100-\u312F\u3200-\u32FF\u3300-\u33FF\u3400-\u4DBF\u4E00-\u9FFF"
+    r"\uF900-\uFAFF\uFE30-\uFE4F\U00020000-\U0002A6DF\U0002A700-\U0002CEAF]"
 )
+
 
 def _strip_cjk(text: str) -> str:
     """Remove CJK (Chinese/Japanese/Korean) characters from text."""
-    return _CJK_RE.sub('', text)
+    return _CJK_RE.sub("", text)
 
 
 def build_system_prompt(extra: str = "") -> str:
@@ -218,26 +224,36 @@ MENU_ORDER = ["chat", "video", "music", "photo", "zip", "fonts"]
 def main_menu_keyboard():
     rows = []
     for i in range(0, len(MENU_ORDER), 2):
-        chunk = MENU_ORDER[i:i + 2]
-        rows.append([
-            InlineKeyboardButton(MENU_SECTIONS[k]["title"], callback_data=f"menu:{k}")
-            for k in chunk
-        ])
-    rows.append([InlineKeyboardButton("🗑 Очистить память", callback_data="reset_memory")])
+        chunk = MENU_ORDER[i : i + 2]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    MENU_SECTIONS[k]["title"], callback_data=f"menu:{k}"
+                )
+                for k in chunk
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton("🗑 Очистить память", callback_data="reset_memory")]
+    )
     return InlineKeyboardMarkup(rows)
 
 
 def section_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:home")],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:home")],
+        ]
+    )
 
 
 def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Меню функций", callback_data="menu:home")],
-        [InlineKeyboardButton("🗑 Очистить память", callback_data="reset_memory")],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📋 Меню функций", callback_data="menu:home")],
+            [InlineKeyboardButton("🗑 Очистить память", callback_data="reset_memory")],
+        ]
+    )
 
 
 MAIN_MENU_TEXT = (
@@ -257,12 +273,11 @@ def ask_groq(user_id, prompt, system_extra: str = ""):
         history = list(user_memory.get(user_id, []))
     history.append({"role": "user", "content": prompt})
 
-    messages = [{"role": "system", "content": build_system_prompt(system_extra)}] + history
+    messages = [
+        {"role": "system", "content": build_system_prompt(system_extra)}
+    ] + history
 
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=messages
-    )
+    response = groq_client.chat.completions.create(model=GROQ_MODEL, messages=messages)
 
     answer = _strip_cjk(response.choices[0].message.content)
     history.append({"role": "assistant", "content": answer})
@@ -273,107 +288,108 @@ def ask_groq(user_id, prompt, system_extra: str = ""):
 
 # ===== FONT DOWNLOAD =====
 
-FONT_RE          = re.compile(r'^шрифт\s+(.+)$', re.IGNORECASE)
-MUSIC_RE         = re.compile(r'^музыка\s+(.+)$', re.IGNORECASE)
-VIDEO_SEARCH_RE  = re.compile(
-    r'^(?:'
-    r'(?:найди|пришли|скачай|покажи|хочу\s+(?:посмотреть|увидеть))\s+(?:видео|ролик|клип|трейлер)\s+(.+)'
-    r'|(?:видео|ролик|трейлер)\s+(.+)'
-    r')$',
-    re.IGNORECASE | re.DOTALL
+FONT_RE = re.compile(r"^шрифт\s+(.+)$", re.IGNORECASE)
+MUSIC_RE = re.compile(r"^музыка\s+(.+)$", re.IGNORECASE)
+VIDEO_SEARCH_RE = re.compile(
+    r"^(?:"
+    r"(?:найди|пришли|скачай|покажи|хочу\s+(?:посмотреть|увидеть))\s+(?:видео|ролик|клип|трейлер)\s+(.+)"
+    r"|(?:видео|ролик|трейлер)\s+(.+)"
+    r")$",
+    re.IGNORECASE | re.DOTALL,
 )
 # Catch bare "видео" / "ролик" / "трейлер" with no query
-VIDEO_BARE_RE = re.compile(r'^(видео|ролик|трейлер|клип)$', re.IGNORECASE)
+VIDEO_BARE_RE = re.compile(r"^(видео|ролик|трейлер|клип)$", re.IGNORECASE)
 
 # Regex to detect "fetch media from internet" intent (pre-filter before Groq classification)
 INTERNET_RE = re.compile(
-    r'\b(пришли|найди|покажи|скачай|дай|отправь|кинь|залей|send|find|get|show|download|fetch|give)\b'
-    r'.{0,120}'
-    r'\b(картинк|фото|изображен|фотографи|схем|фотоинструкц|инструкц|гайд|guide'
-    r'|видео|видеоурок|видео-?инструк|туториал|урок|ролик|клип|музык|саундтрек'
-    r'|ost|трек|песн|soundtrack|song|track|music)',
+    r"\b(пришли|найди|покажи|скачай|дай|отправь|кинь|залей|send|find|get|show|download|fetch|give)\b"
+    r".{0,120}"
+    r"\b(картинк|фото|изображен|фотографи|схем|фотоинструкц|инструкц|гайд|guide"
+    r"|видео|видеоурок|видео-?инструк|туториал|урок|ролик|клип|музык|саундтрек"
+    r"|ost|трек|песн|soundtrack|song|track|music)",
     re.IGNORECASE | re.DOTALL,
 )
 # Catch standalone "тикток" / "шортс" requests (with or without topic)
 TIKTOK_SHORTS_RE = re.compile(
-    r'\b(тикток|тиктоки|tiktok|шортс|шортсы|shorts)\b',
+    r"\b(тикток|тиктоки|tiktok|шортс|шортсы|shorts)\b",
     re.IGNORECASE,
 )
 # Also catch "музыка из фильма/игры/сериала" without leading verb
 MEDIA_FROM_RE = re.compile(
-    r'\b(музык|саундтрек|ost|трек|песн|soundtrack|song).{0,60}\b(фильм|игр|сериал|мультфильм|аним|movie|game|series)',
+    r"\b(музык|саундтрек|ost|трек|песн|soundtrack|song).{0,60}\b(фильм|игр|сериал|мультфильм|аним|movie|game|series)",
     re.IGNORECASE,
 )
 # Catch requests like "как заменить смеситель в картинках / пошагово"
 PHOTO_GUIDE_RE = re.compile(
-    r'\b(как|how).{0,80}\b(картинк|фото|пошагово|по шагам|step.?by.?step|инструкц|схем)',
+    r"\b(как|how).{0,80}\b(картинк|фото|пошагово|по шагам|step.?by.?step|инструкц|схем)",
     re.IGNORECASE | re.DOTALL,
 )
 
 # Catch image search requests: "покажи кота", "найди фото моря", "картинку котика"
 IMAGE_RE = re.compile(
-    r'(?:'
-    r'покажи(?:\s+мне)?'
-    r'|покажите'
-    r'|хочу\s+посмотреть'
-    r'|хочу\s+увидеть'
-    r'|пришли\s+(?:фото|картинк|изображени|фотк)'
-    r'|отправь\s+(?:фото|картинк|изображени)'
-    r'|кинь\s+(?:фото|картинк|изображени)'
-    r'|найди\s+(?:фото|картинк|изображени|фотографи)'
-    r'|дай\s+(?:фото|картинк|изображени)'
-    r'|как\s+выглядит'
-    r'|как\s+выглядят'
-    r'|покажи\s+как\s+выглядит'
-    r'|фото\s+\w'
-    r'|картинк[уи]\s+\w'
-    r'|картинки\s+\w'
-    r'|изображени[ея]\s+\w'
-    r'|фотк[уи]\s+\w'
-    r'|фоточк[уи]\s+\w'
-    r'|скинь\s+(?:фото|картинк|изображени)'
-    r')',
+    r"(?:"
+    r"покажи(?:\s+мне)?"
+    r"|покажите"
+    r"|хочу\s+посмотреть"
+    r"|хочу\s+увидеть"
+    r"|пришли\s+(?:фото|картинк|изображени|фотк)"
+    r"|отправь\s+(?:фото|картинк|изображени)"
+    r"|кинь\s+(?:фото|картинк|изображени)"
+    r"|найди\s+(?:фото|картинк|изображени|фотографи)"
+    r"|дай\s+(?:фото|картинк|изображени)"
+    r"|как\s+выглядит"
+    r"|как\s+выглядят"
+    r"|покажи\s+как\s+выглядит"
+    r"|фото\s+\w"
+    r"|картинк[уи]\s+\w"
+    r"|картинки\s+\w"
+    r"|изображени[ея]\s+\w"
+    r"|фотк[уи]\s+\w"
+    r"|фоточк[уи]\s+\w"
+    r"|скинь\s+(?:фото|картинк|изображени)"
+    r")",
     re.IGNORECASE,
 )
 
 # Trigger verbs that signal "send me something"
 SEND_TRIGGER_RE = re.compile(
-    r'\b(покажи(?:те)?|пришли|найди|дай|кинь|скинь|отправь|хочу\s+(?:увидеть|посмотреть))\b',
+    r"\b(покажи(?:те)?|пришли|найди|дай|кинь|скинь|отправь|хочу\s+(?:увидеть|посмотреть))\b",
     re.IGNORECASE,
 )
 
 # Catch factual/informational queries that need real web search
 INFO_RE = re.compile(
-    r'(?:'
+    r"(?:"
     # Classic info/knowledge questions
-    r'что\s+такое\b|кто\s+такой\b|кто\s+такая\b'
-    r'|расскажи\s+(?:про|о|об)\b'
-    r'|информаци[яю]\s+(?:про|о|об)\b'
-    r'|факты\s+(?:про|о|об)\b'
-    r'|история\s+(?:создания|возникновения|развития|появления|про|о|об)\b'
-    r'|как\s+работает\b|как\s+устроен\b'
-    r'|из\s+чего\s+(?:состоит|сделан|делают)\b'
-    r'|чем\s+знаменит\b|что\s+известно\s+о\b'
-    r'|tell\s+me\s+about\b|what\s+is\b|who\s+is\b|history\s+of\b|facts\s+about\b|how\s+does\b'
+    r"что\s+такое\b|кто\s+такой\b|кто\s+такая\b"
+    r"|расскажи\s+(?:про|о|об)\b"
+    r"|информаци[яю]\s+(?:про|о|об)\b"
+    r"|факты\s+(?:про|о|об)\b"
+    r"|история\s+(?:создания|возникновения|развития|появления|про|о|об)\b"
+    r"|как\s+работает\b|как\s+устроен\b"
+    r"|из\s+чего\s+(?:состоит|сделан|делают)\b"
+    r"|чем\s+знаменит\b|что\s+известно\s+о\b"
+    r"|tell\s+me\s+about\b|what\s+is\b|who\s+is\b|history\s+of\b|facts\s+about\b|how\s+does\b"
     # Real-time / local queries
-    r'|сеанс[ыа]?\b|расписани[ея]\b|афиш[аы]?\b'
-    r'|кинотеатр\w*\b'
-    r'|что\s+(?:идёт|показывают|сейчас\s+идёт)\b'
-    r'|какой\s+фильм|какие\s+фильмы|какое\s+кино'
-    r'|сколько\s+стоит\b|цена\s+(?:на|за)\b|стоимость\b'
-    r'|режим\s+работы\b|часы\s+работы\b|график\s+работы\b'
-    r'|где\s+(?:купить|найти|заказать|находится|расположен\w*)\b'
-    r'|открыт\w*\s+ли\b|работает\s+ли\b'
-    r'|курс\s+(?:доллара|евро|рубля|валют)\b'
-    r'|новости\s+(?:о|про|по|в)\b'
-    r'|последние\s+новости\b'
-    r'|что\s+(?:нового|случилось|произошло|происходит)\b'
-    r'|когда\s+(?:открывается|закрывается|начинается|заканчивается)\b'
-    r'|адрес\s+\w|телефон\s+\w'
-    r'|(?:latest|current|today|now|schedule|showtimes?|cinema|movie\s+times?)\b'
-    r')',
+    r"|сеанс[ыа]?\b|расписани[ея]\b|афиш[аы]?\b"
+    r"|кинотеатр\w*\b"
+    r"|что\s+(?:идёт|показывают|сейчас\s+идёт)\b"
+    r"|какой\s+фильм|какие\s+фильмы|какое\s+кино"
+    r"|сколько\s+стоит\b|цена\s+(?:на|за)\b|стоимость\b"
+    r"|режим\s+работы\b|часы\s+работы\b|график\s+работы\b"
+    r"|где\s+(?:купить|найти|заказать|находится|расположен\w*)\b"
+    r"|открыт\w*\s+ли\b|работает\s+ли\b"
+    r"|курс\s+(?:доллара|евро|рубля|валют)\b"
+    r"|новости\s+(?:о|про|по|в)\b"
+    r"|последние\s+новости\b"
+    r"|что\s+(?:нового|случилось|произошло|происходит)\b"
+    r"|когда\s+(?:открывается|закрывается|начинается|заканчивается)\b"
+    r"|адрес\s+\w|телефон\s+\w"
+    r"|(?:latest|current|today|now|schedule|showtimes?|cinema|movie\s+times?)\b"
+    r")",
     re.IGNORECASE,
 )
+
 
 def classify_intent(text: str) -> dict:
     """Ask Groq to classify what kind of media the user wants.
@@ -427,7 +443,7 @@ def classify_intent(text: str) -> dict:
                         "- For info: keep the query focused and specific to the topic, preserve original language.\n"
                         "- CRITICAL: The query field must ALWAYS be in the same language as the user's message. Russian input → Russian query. English input → English query.\n\n"
                         "Return ONLY valid JSON, no markdown, no explanation:\n"
-                        "{\"intent\": \"images\", \"query\": \"замена кухонного смесителя пошагово\"}"
+                        '{"intent": "images", "query": "замена кухонного смесителя пошагово"}'
                     ),
                 },
                 {"role": "user", "content": text},
@@ -446,13 +462,12 @@ def classify_intent(text: str) -> dict:
         return {"intent": "chat", "query": text}
 
 
-
-
 def _fetch_page_text(url: str, max_chars: int = 4000) -> str:
     """Fetch a URL and return clean readable text (no HTML tags)."""
     try:
         import requests as _req
         from bs4 import BeautifulSoup as _BS
+
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -464,7 +479,9 @@ def _fetch_page_text(url: str, max_chars: int = 4000) -> str:
         resp = _req.get(url, headers=headers, timeout=8, allow_redirects=True)
         resp.encoding = resp.apparent_encoding
         soup = _BS(resp.text, "lxml")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+        for tag in soup(
+            ["script", "style", "nav", "footer", "header", "aside", "form"]
+        ):
             tag.decompose()
         text = " ".join(soup.get_text(" ", strip=True).split())
         return text[:max_chars]
@@ -473,8 +490,17 @@ def _fetch_page_text(url: str, max_chars: int = 4000) -> str:
         return ""
 
 
-_SKIP_DOMAINS = {"youtube.com", "youtu.be", "instagram.com", "facebook.com",
-                 "twitter.com", "t.me", "vk.com", "tiktok.com", "pdf"}
+_SKIP_DOMAINS = {
+    "youtube.com",
+    "youtu.be",
+    "instagram.com",
+    "facebook.com",
+    "twitter.com",
+    "t.me",
+    "vk.com",
+    "tiktok.com",
+    "pdf",
+}
 
 
 def _should_fetch(url: str) -> bool:
@@ -518,13 +544,17 @@ def search_web_info(text: str) -> tuple[str | None, str]:
             if url and _should_fetch(url):
                 page_content = _fetch_page_text(url, max_chars=3500)
                 if page_content:
-                    page_texts.append(f"=== Содержимое: {r.get('title','')} ({url}) ===\n{page_content}")
+                    page_texts.append(
+                        f"=== Содержимое: {r.get('title', '')} ({url}) ===\n{page_content}"
+                    )
                 if len(page_texts) >= 3:
                     break
 
         full_context = base_snippets
         if page_texts:
-            full_context += "\n\n--- ПОЛНЫЙ ТЕКСТ СТРАНИЦ ---\n\n" + "\n\n".join(page_texts)
+            full_context += "\n\n--- ПОЛНЫЙ ТЕКСТ СТРАНИЦ ---\n\n" + "\n\n".join(
+                page_texts
+            )
 
         resp = groq_client.chat.completions.create(
             model=GROQ_MODEL,
@@ -562,19 +592,17 @@ def search_web_info(text: str) -> tuple[str | None, str]:
         full = resp.choices[0].message.content.strip()
 
         image_query = ""
-        img_match = re.search(r'^IMAGE_QUERY:\s*(.+)$', full, re.MULTILINE)
+        img_match = re.search(r"^IMAGE_QUERY:\s*(.+)$", full, re.MULTILINE)
         if img_match:
             val = img_match.group(1).strip()
             image_query = "" if val.upper() == "NONE" else val
-            full = full[:img_match.start()].strip()
+            full = full[: img_match.start()].strip()
 
         return full, image_query
 
     except Exception as e:
         print(f"[search_web_info error] {e}", flush=True)
         return None, ""
-
-
 
 
 def _fetch_video_entries_dm(query: str, count: int = 10) -> list[dict]:
@@ -594,13 +622,19 @@ def _fetch_video_entries_dm(query: str, count: int = 10) -> list[dict]:
             vid_id = e.get("id") or ""
             if not vid_id:
                 continue
-            url = e.get("url") or e.get("webpage_url") or f"https://www.dailymotion.com/video/{vid_id}"
-            result.append({
-                "id": vid_id,
-                "url": url,
-                "title": e.get("title") or query,
-                "duration": e.get("duration"),
-            })
+            url = (
+                e.get("url")
+                or e.get("webpage_url")
+                or f"https://www.dailymotion.com/video/{vid_id}"
+            )
+            result.append(
+                {
+                    "id": vid_id,
+                    "url": url,
+                    "title": e.get("title") or query,
+                    "duration": e.get("duration"),
+                }
+            )
         return result
     except Exception:
         return []
@@ -624,12 +658,14 @@ def _fetch_video_entries_vimeo(query: str, count: int = 10) -> list[dict]:
             if not vid_id:
                 continue
             url = e.get("url") or e.get("webpage_url") or f"https://vimeo.com/{vid_id}"
-            result.append({
-                "id": vid_id,
-                "url": url,
-                "title": e.get("title") or query,
-                "duration": e.get("duration"),
-            })
+            result.append(
+                {
+                    "id": vid_id,
+                    "url": url,
+                    "title": e.get("title") or query,
+                    "duration": e.get("duration"),
+                }
+            )
         return result
     except Exception:
         return []
@@ -639,16 +675,20 @@ def _search_rutube(query: str, count: int = 10) -> list[dict]:
     """Search Rutube via its public search API and return video entries."""
     try:
         import urllib.parse as _up
+
         q = _up.quote(query)
         api_url = f"https://rutube.ru/api/search/video/?query={q}&page=1&format=json"
-        req = urllib.request.Request(api_url, headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json",
-        })
+        req = urllib.request.Request(
+            api_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json",
+            },
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
         results = data.get("results", [])
@@ -660,12 +700,14 @@ def _search_rutube(query: str, count: int = 10) -> list[dict]:
             if r.get("is_deleted") or r.get("is_hidden") or r.get("is_paid"):
                 continue
             url = r.get("video_url") or f"https://rutube.ru/video/{vid_id}/"
-            entries.append({
-                "id": vid_id,
-                "url": url,
-                "title": r.get("title") or query,
-                "duration": r.get("duration"),
-            })
+            entries.append(
+                {
+                    "id": vid_id,
+                    "url": url,
+                    "title": r.get("title") or query,
+                    "duration": r.get("duration"),
+                }
+            )
         return entries
     except Exception:
         return []
@@ -714,11 +756,17 @@ def _kp_find_film_id(query: str) -> tuple[str, str] | None:
                             node = node[k]
                         if node and isinstance(node, list):
                             f = node[0]
-                            fid = str(f.get("id") or f.get("filmId") or f.get("kinopoiskId") or "")
+                            fid = str(
+                                f.get("id")
+                                or f.get("filmId")
+                                or f.get("kinopoiskId")
+                                or ""
+                            )
                             title = (
                                 (f.get("title") or {}).get("russian")
                                 or (f.get("title") or {}).get("original")
-                                or f.get("nameRu") or f.get("nameEn")
+                                or f.get("nameRu")
+                                or f.get("nameEn")
                                 or query
                             )
                             if fid.isdigit():
@@ -729,7 +777,9 @@ def _kp_find_film_id(query: str) -> tuple[str, str] | None:
                 pass
 
         # Fallback: scan /film/ID/ href patterns from the HTML
-        film_ids = re.findall(r'href=["\'](?:https://www\.kinopoisk\.ru)?/film/(\d{4,})[/"\'?]', html)
+        film_ids = re.findall(
+            r'href=["\'](?:https://www\.kinopoisk\.ru)?/film/(\d{4,})[/"\'?]', html
+        )
         if film_ids:
             return film_ids[0], query
     except Exception as e:
@@ -741,10 +791,13 @@ def _kp_find_film_id(query: str) -> tuple[str, str] | None:
             f"https://suggest-kinopoisk.yandex.net/suggest-kinopoisk"
             f"?srv=kinopoisk&part={q_enc}&limit=5&lang=ru"
         )
-        req2 = urllib.request.Request(sug_url, headers={
-            "User-Agent": headers["User-Agent"],
-            "Referer": "https://www.kinopoisk.ru/",
-        })
+        req2 = urllib.request.Request(
+            sug_url,
+            headers={
+                "User-Agent": headers["User-Agent"],
+                "Referer": "https://www.kinopoisk.ru/",
+            },
+        )
         with urllib.request.urlopen(req2, timeout=8) as resp2:
             raw = resp2.read().decode("utf-8", errors="replace")
         data2 = _json.loads(raw)
@@ -772,7 +825,7 @@ def _kp_find_film_id(query: str) -> tuple[str, str] | None:
 # tv_embedded: most formats; android variants: bypass bot-detection better
 _YT_CLIENTS = ["tv_embedded", "android_embedded", "android_vr", "android"]
 
-_IS_YT_URL = re.compile(r'youtube\.com|youtu\.be', re.IGNORECASE)
+_IS_YT_URL = re.compile(r"youtube\.com|youtu\.be", re.IGNORECASE)
 
 _YT_BOT_ERRORS = ("sign in", "bot", "429", "confirm", "cookies", "age")
 
@@ -801,7 +854,9 @@ def _download_video_url(url: str, title_fallback: str = "") -> tuple[bytes, str]
                         "merge_output_format": "mp4",
                     }
                     if client:
-                        extra["extractor_args"] = {"youtube": {"player_client": [client]}}
+                        extra["extractor_args"] = {
+                            "youtube": {"player_client": [client]}
+                        }
                     opts = _base_opts(tmpdir, extra)
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         info = ydl.extract_info(url, download=True)
@@ -810,10 +865,25 @@ def _download_video_url(url: str, title_fallback: str = "") -> tuple[bytes, str]
                     if size > MAX_FILE_SIZE:
                         small_path = os.path.join(tmpdir, "small.mp4")
                         r = subprocess.run(
-                            ["ffmpeg", "-y", "-i", filepath,
-                             "-vf", "scale=-2:480", "-c:v", "libx264",
-                             "-crf", "28", "-preset", "fast",
-                             "-c:a", "aac", "-b:a", "96k", small_path],
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-i",
+                                filepath,
+                                "-vf",
+                                "scale=-2:480",
+                                "-c:v",
+                                "libx264",
+                                "-crf",
+                                "28",
+                                "-preset",
+                                "fast",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "96k",
+                                small_path,
+                            ],
                             capture_output=True,
                         )
                         if r.returncode == 0 and os.path.exists(small_path):
@@ -824,7 +894,11 @@ def _download_video_url(url: str, title_fallback: str = "") -> tuple[bytes, str]
                                 continue
                         else:
                             continue
-                    title = (info or {}).get("title", title_fallback) if isinstance(info, dict) else title_fallback
+                    title = (
+                        (info or {}).get("title", title_fallback)
+                        if isinstance(info, dict)
+                        else title_fallback
+                    )
                     with open(filepath, "rb") as f:
                         return f.read(), title or title_fallback
             except Exception as e:
@@ -839,7 +913,9 @@ def _download_video_url(url: str, title_fallback: str = "") -> tuple[bytes, str]
     raise RuntimeError(f"Не удалось скачать видео: {url[:80]}")
 
 
-def _fetch_video_entries_yt(query: str, count: int = 20, max_dur: int = 720) -> list[dict]:
+def _fetch_video_entries_yt(
+    query: str, count: int = 20, max_dur: int = 720
+) -> list[dict]:
     """Search YouTube for video entries — no API key required (yt_dlp ytsearch)."""
     flat_opts = {
         "quiet": True,
@@ -864,21 +940,36 @@ def _fetch_video_entries_yt(query: str, count: int = 20, max_dur: int = 720) -> 
             title = e.get("title") or query
             title_l = title.lower()
             # Skip obvious compilations
-            if any(k in title_l for k in ("compilation", "сборник", "подборка", "топ ", "нон-стоп",
-                                           "hours", "часов", "нонстоп", "best of", "greatest")):
+            if any(
+                k in title_l
+                for k in (
+                    "compilation",
+                    "сборник",
+                    "подборка",
+                    "топ ",
+                    "нон-стоп",
+                    "hours",
+                    "часов",
+                    "нонстоп",
+                    "best of",
+                    "greatest",
+                )
+            ):
                 continue
             url = (
                 e.get("url")
                 or e.get("webpage_url")
                 or f"https://www.youtube.com/watch?v={vid_id}"
             )
-            result.append({
-                "id": f"yt_{vid_id}",
-                "url": url,
-                "title": title,
-                "duration": duration,
-                "platform": "YouTube",
-            })
+            result.append(
+                {
+                    "id": f"yt_{vid_id}",
+                    "url": url,
+                    "title": title,
+                    "duration": duration,
+                    "platform": "YouTube",
+                }
+            )
         return result
     except Exception:
         return []
@@ -983,9 +1074,13 @@ def _collect_video_entries(query: str) -> list[dict]:
 
 
 def _video_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("▶️ Следующий", callback_data="next_video"),
-    ]])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("▶️ Следующий", callback_data="next_video"),
+            ]
+        ]
+    )
 
 
 # ── Persistent state for video "Next" button ───────────────────────────────
@@ -996,10 +1091,15 @@ video_search_state: dict[int, dict] = {}
 # Maps user_id → {"query": str, "queries": [str,...], "idx": int}
 music_search_state: dict[int, dict] = {}
 
+
 def _music_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Ещё", callback_data="next_music"),
-    ]])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔄 Ещё", callback_data="next_music"),
+            ]
+        ]
+    )
 
 
 def _is_artist_only(query: str) -> bool:
@@ -1007,8 +1107,21 @@ def _is_artist_only(query: str) -> bool:
     q = query.strip()
     if any(sep in q for sep in (" - ", " – ", " — ")):
         return False
-    song_hints = ("official", "lyrics", "audio", "video", "feat", "ft.", "remix",
-                  "acoustic", "live", "(", "cover", "original", "instrumental")
+    song_hints = (
+        "official",
+        "lyrics",
+        "audio",
+        "video",
+        "feat",
+        "ft.",
+        "remix",
+        "acoustic",
+        "live",
+        "(",
+        "cover",
+        "original",
+        "instrumental",
+    )
     if any(k in q.lower() for k in song_hints):
         return False
     return len(q.split()) <= 4
@@ -1022,9 +1135,24 @@ def _filter_music_entry(title: str, duration) -> bool:
     if dur and (dur < 55 or dur > 620):
         return False
     skip_kw = (
-        "full album", "greatest hits", "compilation", "playlist", "best of",
-        "megamix", "medley", "non-stop", "nonstop", "1 hour", "2 hour", "10 hour",
-        "сборник", "все хиты", "подборка", "микс", "all songs", "full ost",
+        "full album",
+        "greatest hits",
+        "compilation",
+        "playlist",
+        "best of",
+        "megamix",
+        "medley",
+        "non-stop",
+        "nonstop",
+        "1 hour",
+        "2 hour",
+        "10 hour",
+        "сборник",
+        "все хиты",
+        "подборка",
+        "микс",
+        "all songs",
+        "full ost",
     )
     title_l = title.lower()
     if any(k in title_l for k in skip_kw):
@@ -1042,7 +1170,11 @@ def search_music_candidates(query: str) -> list[dict]:
     if is_artist:
         # For artist-only: search directly by name (SoundCloud returns actual artist tracks)
         sc_queries = [query, f"{query} official"]
-        yt_queries = [f"{query} official music video", f"{query} popular songs", f"{query} top hits"]
+        yt_queries = [
+            f"{query} official music video",
+            f"{query} popular songs",
+            f"{query} top hits",
+        ]
         rt_queries = [f"{query} официальный", query]
     else:
         sc_queries = [query, f"{query} official audio"]
@@ -1051,17 +1183,17 @@ def search_music_candidates(query: str) -> list[dict]:
 
     candidates: list[dict] = []
     seen: set[str] = set()
-    artist_norm = re.sub(r'\W+', ' ', query.lower()).strip() if is_artist else ""
+    artist_norm = re.sub(r"\W+", " ", query.lower()).strip() if is_artist else ""
 
     def _norm(t: str) -> str:
-        return re.sub(r'\W+', ' ', t.lower()).strip()
+        return re.sub(r"\W+", " ", t.lower()).strip()
 
     def _uploader_matches(entry: dict) -> bool:
         """True if this track is by the queried artist (for artist-only searches)."""
         if not is_artist:
             return True
         uploader = (entry.get("uploader") or entry.get("channel") or "").lower()
-        uploader_norm = re.sub(r'\W+', ' ', uploader).strip()
+        uploader_norm = re.sub(r"\W+", " ", uploader).strip()
         return artist_norm in uploader_norm or uploader_norm in artist_norm
 
     def _add(entry: dict, source: str):
@@ -1077,8 +1209,15 @@ def search_music_candidates(query: str) -> list[dict]:
             return
         seen.add(key)
         priority = 0 if _uploader_matches(entry) else 1
-        candidates.append({"url": url, "title": title, "source": source,
-                            "duration": dur, "priority": priority})
+        candidates.append(
+            {
+                "url": url,
+                "title": title,
+                "source": source,
+                "duration": dur,
+                "priority": priority,
+            }
+        )
 
     # SoundCloud
     for sq in sc_queries[:2]:
@@ -1093,7 +1232,9 @@ def search_music_candidates(query: str) -> list[dict]:
 
     # YouTube
     yt_opts = {
-        "quiet": True, "no_warnings": True, "extract_flat": True,
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
         "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
     }
     for sq in yt_queries[:2]:
@@ -1150,7 +1291,9 @@ def download_music_from_candidate(candidate: dict) -> tuple[bytes, str, str]:
         return _read_audio_result(tmpdir, info, title_hint)
 
 
-def search_and_download_first_music(query: str) -> tuple[tuple[bytes, str, str], list[dict], int]:
+def search_and_download_first_music(
+    query: str,
+) -> tuple[tuple[bytes, str, str], list[dict], int]:
     """
     Search candidates and download the first successful one.
     Returns (result, all_candidates, used_index).
@@ -1170,8 +1313,7 @@ def search_and_download_first_music(query: str) -> tuple[tuple[bytes, str, str],
             last_err = e
             continue
     raise RuntimeError(
-        f"Не удалось скачать музыку по запросу «{query}».\n"
-        f"Последняя ошибка: {last_err}"
+        f"Не удалось скачать музыку по запросу «{query}».\nПоследняя ошибка: {last_err}"
     )
 
 
@@ -1193,6 +1335,7 @@ def _download_raw(url: str) -> bytes:
 # ===== IMAGE SEARCH =====
 
 import threading as _threading
+
 _img_lock = _threading.Lock()
 _img_last_time: float = 0.0
 
@@ -1200,6 +1343,7 @@ _img_last_time: float = 0.0
 def _bing_images(query: str, max_results: int = 5, safe: bool = True) -> list[dict]:
     """Scrape Bing image search (no API key needed)."""
     import urllib.parse
+
     q = urllib.parse.quote(query)
     safesearch = "Off" if not safe else "Moderate"
     url = (
@@ -1207,16 +1351,19 @@ def _bing_images(query: str, max_results: int = 5, safe: bool = True) -> list[di
         f"&count={max_results * 6}&safeSearch={safesearch}"
         f"&FORM=HDRSC2"
     )
-    req = urllib.request.Request(url, headers={
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.bing.com/",
-    })
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.bing.com/",
+        },
+    )
     with urllib.request.urlopen(req, timeout=15) as resp:
         html = resp.read().decode("utf-8", errors="replace")
 
@@ -1235,6 +1382,7 @@ def _bing_images(query: str, max_results: int = 5, safe: bool = True) -> list[di
 def _ddg_images(query: str, max_results: int = 5, safe: bool = True) -> list[dict]:
     """DuckDuckGo image search fallback."""
     import time
+
     safesearch = "moderate" if safe else "off"
     ddgs = DDGS(timeout=10)
     raw = list(ddgs.images(query, safesearch=safesearch, max_results=max_results * 4))
@@ -1250,37 +1398,43 @@ def _ddg_images(query: str, max_results: int = 5, safe: bool = True) -> list[dic
 
 def search_images(query: str, max_results: int = 5, safe: bool = True) -> list[dict]:
     """Search images via Bing (primary) with DuckDuckGo fallback.
-    Thread-safe with rate limiting."""
+    Thread-safe with rate limiting. Lock is held only briefly — sleep happens outside."""
     import time
+
     global _img_last_time
 
+    # Hold lock only to check/update the rate-limit timestamp, never while sleeping
     with _img_lock:
-        elapsed = time.time() - _img_last_time
-        if elapsed < 3.0:
-            time.sleep(3.0 - elapsed)
-        _img_last_time = time.time()
+        now = time.time()
+        elapsed = now - _img_last_time
+        wait = max(0.0, 3.0 - elapsed)
+        # Reserve our slot in the future so other threads don't overlap
+        _img_last_time = now + wait
 
-        # 1. Try Bing first
-        for attempt in range(2):
-            try:
-                results = _bing_images(query, max_results, safe)
-                if results:
-                    return results
-            except Exception:
-                if attempt == 0:
-                    time.sleep(2)
+    if wait > 0:
+        time.sleep(wait)
 
-        # 2. Fallback to DuckDuckGo
-        for attempt in range(2):
-            try:
-                results = _ddg_images(query, max_results, safe)
-                if results:
-                    return results
-            except Exception:
-                if attempt == 0:
-                    time.sleep(3)
+    # 1. Try Bing first
+    for attempt in range(2):
+        try:
+            results = _bing_images(query, max_results, safe)
+            if results:
+                return results
+        except Exception:
+            if attempt == 0:
+                time.sleep(2)
 
-        return []
+    # 2. Fallback to DuckDuckGo
+    for attempt in range(2):
+        try:
+            results = _ddg_images(query, max_results, safe)
+            if results:
+                return results
+        except Exception:
+            if attempt == 0:
+                time.sleep(3)
+
+    return []
 
 
 def download_image(url: str, timeout: int = 10) -> bytes:
@@ -1302,22 +1456,22 @@ def extract_image_query(text: str) -> str:
     text = text.strip()
     # Try specific multi-word patterns first (order matters — longest first)
     for pat in [
-        r'покажи\s+как\s+выглядит\s+',
-        r'покажи(?:те)?\s+мне\s+',
-        r'покажи(?:те)?\s+',
-        r'хочу\s+(?:увидеть|посмотреть)\s+(?:фото|картинк\w*|изображени\w*\s+)?',
-        r'пришли\s+(?:мне\s+)?(?:фото|картинк\w+|фотк\w+|изображени\w+|фоточк\w+)\s+',
-        r'отправь\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+',
-        r'кинь\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+',
-        r'скинь\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+',
-        r'дай\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+',
-        r'найди\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+|фотографи\w+)\s+',
-        r'как\s+выглядят?\s+',
-        r'(?:фото|картинк[уи]|картинки|изображени[ея]|фотк[уи]|фоточк[уи])\s+',
+        r"покажи\s+как\s+выглядит\s+",
+        r"покажи(?:те)?\s+мне\s+",
+        r"покажи(?:те)?\s+",
+        r"хочу\s+(?:увидеть|посмотреть)\s+(?:фото|картинк\w*|изображени\w*\s+)?",
+        r"пришли\s+(?:мне\s+)?(?:фото|картинк\w+|фотк\w+|изображени\w+|фоточк\w+)\s+",
+        r"отправь\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+",
+        r"кинь\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+",
+        r"скинь\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+",
+        r"дай\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+)\s+",
+        r"найди\s+(?:мне\s+)?(?:фото|картинк\w+|изображени\w+|фотографи\w+)\s+",
+        r"как\s+выглядят?\s+",
+        r"(?:фото|картинк[уи]|картинки|изображени[ея]|фотк[уи]|фоточк[уи])\s+",
         # Fallback: strip bare trigger verb even without photo word
-        r'^\s*(?:пришли|найди|дай|кинь|скинь|отправь)\s+(?:мне\s+)?',
+        r"^\s*(?:пришли|найди|дай|кинь|скинь|отправь)\s+(?:мне\s+)?",
     ]:
-        new_text = re.sub(pat, '', text, flags=re.IGNORECASE).strip()
+        new_text = re.sub(pat, "", text, flags=re.IGNORECASE).strip()
         if new_text and new_text != text:
             text = new_text
             break
@@ -1326,15 +1480,17 @@ def extract_image_query(text: str) -> str:
 
 # ===== FONTS =====
 
+
 def _github_font_listing(slug: str) -> list | None:
     """Return list of file dicts from google/fonts GitHub repo for the given slug."""
     for lic in ("ofl", "apache", "ufl"):
-        url = (
-            f"https://api.github.com/repos/google/fonts/contents/{lic}/{slug}"
-        )
+        url = f"https://api.github.com/repos/google/fonts/contents/{lic}/{slug}"
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/vnd.github.v3+json"},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/vnd.github.v3+json",
+            },
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -1383,12 +1539,15 @@ def _pick_font_file(
     return None
 
 
-def _pick_from_zip(zip_bytes: bytes, canonical: str | None, style: str, is_italic: bool) -> tuple[str, bytes] | None:
+def _pick_from_zip(
+    zip_bytes: bytes, canonical: str | None, style: str, is_italic: bool
+) -> tuple[str, bytes] | None:
     """Extract the best matching TTF/OTF file from a ZIP archive."""
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             entries = [
-                n for n in zf.namelist()
+                n
+                for n in zf.namelist()
                 if n.lower().endswith((".ttf", ".otf"))
                 and not os.path.basename(n).startswith(".")
             ]
@@ -1415,7 +1574,9 @@ def _pick_from_zip(zip_bytes: bytes, canonical: str | None, style: str, is_itali
             if static:
                 style_clean = style.lower().replace(" ", "")
                 for b, p in static:
-                    base = os.path.splitext(b)[0].lower().replace("-", "").replace("_", "")
+                    base = (
+                        os.path.splitext(b)[0].lower().replace("-", "").replace("_", "")
+                    )
                     if style_clean in base:
                         return _read(p)
                 return _read(static[0][1])
@@ -1431,7 +1592,9 @@ def _pick_from_zip(zip_bytes: bytes, canonical: str | None, style: str, is_itali
     return None
 
 
-def _download_from_google_fonts(font_name: str, canonical: str | None, style: str, is_italic: bool) -> tuple[str, bytes] | None:
+def _download_from_google_fonts(
+    font_name: str, canonical: str | None, style: str, is_italic: bool
+) -> tuple[str, bytes] | None:
     """Try Google Fonts via GitHub repository."""
     slug_dash = font_name.lower().replace(" ", "-")
     slug_none = font_name.lower().replace(" ", "")
@@ -1451,7 +1614,10 @@ def _download_from_google_fonts(font_name: str, canonical: str | None, style: st
     if static_dirs:
         req = urllib.request.Request(
             static_dirs[0]["url"],
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/vnd.github.v3+json"},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/vnd.github.v3+json",
+            },
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -1477,14 +1643,19 @@ def _download_from_google_fonts(font_name: str, canonical: str | None, style: st
     return filename, _download_raw(dl_url)
 
 
-def _download_from_dafont(font_name: str, canonical: str | None, style: str, is_italic: bool) -> tuple[str, bytes] | None:
+def _download_from_dafont(
+    font_name: str, canonical: str | None, style: str, is_italic: bool
+) -> tuple[str, bytes] | None:
     """Try DaFont as a fallback source."""
     slug = font_name.lower().replace(" ", "_")
     url = f"https://dl.dafont.com/dl/?f={slug}"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": f"https://www.dafont.com/{font_name.lower().replace(' ', '-')}.font",
-    })
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": f"https://www.dafont.com/{font_name.lower().replace(' ', '-')}.font",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             zip_bytes = resp.read()
@@ -1495,9 +1666,13 @@ def _download_from_dafont(font_name: str, canonical: str | None, style: str, is_
         return None
 
 
-def _download_from_ofont(font_name: str, canonical: str | None, style: str, is_italic: bool) -> tuple[str, bytes] | None:
+def _download_from_ofont(
+    font_name: str, canonical: str | None, style: str, is_italic: bool
+) -> tuple[str, bytes] | None:
     """Try ofont.ru — large Russian font database with direct TTF downloads."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
     search_url = f"https://ofont.ru/search/?q={urllib.parse.quote(font_name)}"
     try:
         req = urllib.request.Request(search_url, headers=headers)
@@ -1532,17 +1707,26 @@ def _download_from_ofont(font_name: str, canonical: str | None, style: str, is_i
         raw_title = title_m.group(1)
         # "Шрифт Proxima Nova Bold - скачать на oFont.ru"
         title_clean = re.sub(r"шрифт\s*", "", raw_title, flags=re.IGNORECASE)
-        title_clean = re.sub(r"\s*-\s*скачать.*", "", title_clean, flags=re.IGNORECASE).strip()
+        title_clean = re.sub(
+            r"\s*-\s*скачать.*", "", title_clean, flags=re.IGNORECASE
+        ).strip()
         # Extract style part: remove the font name prefix
         style_in_title = title_clean
         for word in font_name.split():
-            style_in_title = re.sub(re.escape(word), "", style_in_title, flags=re.IGNORECASE)
+            style_in_title = re.sub(
+                re.escape(word), "", style_in_title, flags=re.IGNORECASE
+            )
         style_in_title = style_in_title.strip().lower()
 
         score = 0
         if style_lc and style_lc in style_in_title:
             score += 10
-        if not style_in_title or style_in_title in ("regular", "обычный", "кириллица", ""):
+        if not style_in_title or style_in_title in (
+            "regular",
+            "обычный",
+            "кириллица",
+            "",
+        ):
             if style_lc in ("regular", "обычный", "normal", ""):
                 score += 8
             else:
@@ -1562,10 +1746,13 @@ def _download_from_ofont(font_name: str, canonical: str | None, style: str, is_i
 
     dl_url = f"https://ofont.ru/index.php?act=download&font_id={best_id}"
     try:
-        req = urllib.request.Request(dl_url, headers={
-            **headers,
-            "Referer": f"https://ofont.ru/view/{best_id}",
-        })
+        req = urllib.request.Request(
+            dl_url,
+            headers={
+                **headers,
+                "Referer": f"https://ofont.ru/view/{best_id}",
+            },
+        )
         with urllib.request.urlopen(req, timeout=25) as resp:
             data = resp.read()
     except Exception:
@@ -1575,7 +1762,11 @@ def _download_from_ofont(font_name: str, canonical: str | None, style: str, is_i
         return None
 
     safe_name = font_name.replace(" ", "")
-    style_suffix = best_style_in_title.title().replace(" ", "") if best_style_in_title else "Regular"
+    style_suffix = (
+        best_style_in_title.title().replace(" ", "")
+        if best_style_in_title
+        else "Regular"
+    )
     fname = f"{safe_name}-{style_suffix}.ttf"
 
     if data[:4] in (b"\x00\x01\x00\x00", b"OTTO", b"true"):
@@ -1631,7 +1822,10 @@ def _get_all_google_fonts_files(font_name: str) -> list[tuple[str, str]] | None:
     if static_dirs:
         req = urllib.request.Request(
             static_dirs[0]["url"],
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/vnd.github.v3+json"},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/vnd.github.v3+json",
+            },
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -1651,7 +1845,9 @@ def _get_all_google_fonts_files(font_name: str) -> list[tuple[str, str]] | None:
 
 def _download_all_from_ofont(font_name: str) -> list[tuple[str, bytes]] | None:
     """Download all matching font styles from ofont.ru."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
     search_url = f"https://ofont.ru/search/?q={urllib.parse.quote(font_name)}"
     try:
         req = urllib.request.Request(search_url, headers=headers)
@@ -1682,17 +1878,22 @@ def _download_all_from_ofont(font_name: str) -> list[tuple[str, bytes]] | None:
             continue
         raw_title = title_m.group(1)
         title_clean = re.sub(r"шрифт\s*", "", raw_title, flags=re.IGNORECASE)
-        title_clean = re.sub(r"\s*-\s*скачать.*", "", title_clean, flags=re.IGNORECASE).strip()
+        title_clean = re.sub(
+            r"\s*-\s*скачать.*", "", title_clean, flags=re.IGNORECASE
+        ).strip()
 
         if not any(w.lower() in title_clean.lower() for w in font_words):
             continue
 
         dl_url = f"https://ofont.ru/index.php?act=download&font_id={font_id}"
         try:
-            req = urllib.request.Request(dl_url, headers={
-                **headers,
-                "Referer": f"https://ofont.ru/view/{font_id}",
-            })
+            req = urllib.request.Request(
+                dl_url,
+                headers={
+                    **headers,
+                    "Referer": f"https://ofont.ru/view/{font_id}",
+                },
+            )
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = resp.read()
         except Exception:
@@ -1703,7 +1904,9 @@ def _download_all_from_ofont(font_name: str) -> list[tuple[str, bytes]] | None:
 
         style_in_title = title_clean
         for word in font_name.split():
-            style_in_title = re.sub(re.escape(word), "", style_in_title, flags=re.IGNORECASE)
+            style_in_title = re.sub(
+                re.escape(word), "", style_in_title, flags=re.IGNORECASE
+            )
         style_in_title = style_in_title.strip().title().replace(" ", "") or "Regular"
 
         safe_name = font_name.replace(" ", "")
@@ -1753,10 +1956,13 @@ def download_all_fonts(font_name: str) -> tuple[str, bytes]:
     # 2. Try DaFont (returns a ZIP with all styles)
     slug = font_name.lower().replace(" ", "_")
     url = f"https://dl.dafont.com/dl/?f={slug}"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": f"https://www.dafont.com/{font_name.lower().replace(' ', '-')}.font",
-    })
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": f"https://www.dafont.com/{font_name.lower().replace(' ', '-')}.font",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             zip_bytes = resp.read()
@@ -1784,7 +1990,7 @@ def download_all_fonts(font_name: str) -> tuple[str, bytes]:
 
 # ===== PHOTO UPSCALE x3 =====
 
-UPSCALE_RE = re.compile(r'улучши\s*фото', re.IGNORECASE)
+UPSCALE_RE = re.compile(r"улучши\s*фото", re.IGNORECASE)
 
 _MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".models")
 _ESPCN_PATH = os.path.join(_MODEL_DIR, "ESPCN_x3.pb")
@@ -1798,6 +2004,7 @@ def _get_sr():
     if _sr_instance is not None:
         return _sr_instance
     import cv2
+
     os.makedirs(_MODEL_DIR, exist_ok=True)
     if not os.path.exists(_ESPCN_PATH):
         urllib.request.urlretrieve(_ESPCN_URL, _ESPCN_PATH)
@@ -1808,7 +2015,9 @@ def _get_sr():
     return sr
 
 
-def upscale_image_x4(image_bytes: bytes) -> tuple[bytes, tuple[int, int], tuple[int, int]]:
+def upscale_image_x4(
+    image_bytes: bytes,
+) -> tuple[bytes, tuple[int, int], tuple[int, int]]:
     """
     Upscale image 3x using ESPCN neural network super-resolution via OpenCV DNN.
     Falls back to LANCZOS if model unavailable.
@@ -1833,9 +2042,12 @@ def upscale_image_x4(image_bytes: bytes) -> tuple[bytes, tuple[int, int], tuple[
         upscaled_pil = ImageEnhance.Sharpness(upscaled_pil).enhance(1.3)
     except Exception:
         from PIL import ImageFilter
+
         upscaled_pil = img_pil.resize((new_w, new_h), Image.LANCZOS)
         upscaled_pil = ImageEnhance.Sharpness(upscaled_pil).enhance(1.5)
-        upscaled_pil = upscaled_pil.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3))
+        upscaled_pil = upscaled_pil.filter(
+            ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3)
+        )
 
     buf = io.BytesIO()
     upscaled_pil.save(buf, format="PNG", optimize=False, compress_level=1)
@@ -1846,7 +2058,7 @@ def upscale_image_x4(image_bytes: bytes) -> tuple[bytes, tuple[int, int], tuple[
 
 # ===== TEXT PERCENTAGE ANALYSIS =====
 
-TEXT_PCT_RE = re.compile(r'процент\s*текста', re.IGNORECASE)
+TEXT_PCT_RE = re.compile(r"процент\s*текста", re.IGNORECASE)
 
 
 def analyze_text_percentage(image_bytes: bytes) -> str:
@@ -1897,14 +2109,15 @@ def analyze_text_percentage(image_bytes: bytes) -> str:
 
 # ===== IMAGE COMPRESSION =====
 
+
 def parse_target_size(text: str) -> int | None:
     """Parse size like '500кб', '1.5мб', '200kb', '2mb' → bytes."""
-    m = re.search(r'(\d+(?:[.,]\d+)?)\s*(мб|mb|кб|kb|к\b|k\b|м\b|m\b)', text.lower())
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(мб|mb|кб|kb|к\b|k\b|м\b|m\b)", text.lower())
     if not m:
         return None
-    value = float(m.group(1).replace(',', '.'))
+    value = float(m.group(1).replace(",", "."))
     unit = m.group(2)
-    if unit in ('мб', 'mb', 'м', 'm'):
+    if unit in ("мб", "mb", "м", "m"):
         return int(value * 1024 * 1024)
     return int(value * 1024)
 
@@ -2014,10 +2227,7 @@ async def _process_album(media_group_id: str, context):
             chat_id=chat_id,
             document=zip_buf,
             filename="compressed.zip",
-            caption=(
-                f"✅ {len(photos)} фото сжато\n"
-                f"Средний размер: {avg_kb:.1f} КБ"
-            ),
+            caption=(f"✅ {len(photos)} фото сжато\nСредний размер: {avg_kb:.1f} КБ"),
         )
         await context.bot.delete_message(chat_id=chat_id, message_id=status.message_id)
     except Exception as e:
@@ -2059,15 +2269,19 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fmt = "PNG"
             if size_mb > 45:
                 from PIL import Image as _Image, ImageEnhance as _IE, ImageFilter as _IF
+
                 img_big = _Image.open(io.BytesIO(result_bytes))
                 buf2 = io.BytesIO()
-                img_big.convert("RGB").save(buf2, format="JPEG", quality=95, optimize=True)
+                img_big.convert("RGB").save(
+                    buf2, format="JPEG", quality=95, optimize=True
+                )
                 result_bytes = buf2.getvalue()
                 size_mb = len(result_bytes) / (1024 * 1024)
                 filename = "upscaled_3x.jpg"
                 fmt = "JPEG"
             await _safe_send_doc(
-                message, result_bytes,
+                message,
+                result_bytes,
                 filename=filename,
                 caption=(
                     f"✅ Готово! Увеличено в 3x ({fmt})\n"
@@ -2087,7 +2301,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dl = io.BytesIO()
             await file.download_to_memory(dl)
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(_EXECUTOR, analyze_text_percentage, dl.getvalue())
+            result = await loop.run_in_executor(
+                _EXECUTOR, analyze_text_percentage, dl.getvalue()
+            )
             await message.reply_text(f"📊 {result}")
             await msg.delete()
         except Exception as e:
@@ -2149,6 +2365,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== VIDEO DOWNLOAD =====
 
+
 def _find_file(tmpdir, preferred_ext=None):
     """Return path to the best matching file in tmpdir, preferring preferred_ext."""
     files = [
@@ -2182,10 +2399,13 @@ def _base_opts(tmpdir, extra=None):
 
 def download_video(url):
     with tempfile.TemporaryDirectory() as tmpdir:
-        opts = _base_opts(tmpdir, {
-            "format": "best[ext=mp4][filesize<50M]/best[ext=mp4]/best[filesize<50M]/best",
-            "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
-        })
+        opts = _base_opts(
+            tmpdir,
+            {
+                "format": "best[ext=mp4][filesize<50M]/best[ext=mp4]/best[filesize<50M]/best",
+                "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+            },
+        )
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -2205,16 +2425,22 @@ def download_video(url):
 
 # ===== MUSIC DOWNLOAD =====
 
+
 def _audio_opts(tmpdir, extra=None):
-    opts = _base_opts(tmpdir, {
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-    })
+    opts = _base_opts(
+        tmpdir,
+        {
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        },
+    )
     if extra:
         opts.update(extra)
     return opts
@@ -2222,6 +2448,7 @@ def _audio_opts(tmpdir, extra=None):
 
 def _read_audio_result(tmpdir, info, fallback_title: str):
     import subprocess
+
     if isinstance(info, dict) and "entries" in info:
         entries = [e for e in (info.get("entries") or []) if e]
         if not entries:
@@ -2238,19 +2465,26 @@ def _read_audio_result(tmpdir, info, fallback_title: str):
         try:
             subprocess.run(
                 ["ffmpeg", "-y", "-i", filepath, "-b:a", "96k", low_path],
-                capture_output=True, check=True,
+                capture_output=True,
+                check=True,
             )
             low_size = os.path.getsize(low_path)
             if low_size <= MAX_FILE_SIZE:
                 filepath = low_path
                 size = low_size
             else:
-                raise ValueError(f"Файл слишком большой ({size // (1024 * 1024)} МБ). Лимит — 50 МБ.")
+                raise ValueError(
+                    f"Файл слишком большой ({size // (1024 * 1024)} МБ). Лимит — 50 МБ."
+                )
         except subprocess.CalledProcessError:
-            raise ValueError(f"Файл слишком большой ({size // (1024 * 1024)} МБ). Лимит — 50 МБ.")
+            raise ValueError(
+                f"Файл слишком большой ({size // (1024 * 1024)} МБ). Лимит — 50 МБ."
+            )
     with open(filepath, "rb") as f:
         data = f.read()
-    title = info.get("title", fallback_title) if isinstance(info, dict) else fallback_title
+    title = (
+        info.get("title", fallback_title) if isinstance(info, dict) else fallback_title
+    )
     artist = info.get("uploader", "") if isinstance(info, dict) else ""
     return data, title, artist
 
@@ -2283,7 +2517,11 @@ def _sc_search_best(query: str, tmpdir: str, count: int = 5):
     if not entries:
         raise RuntimeError("Нет результатов на SoundCloud")
     # Score and sort — pick best match
-    scored = sorted(entries, key=lambda e: _best_match_score(e.get("title", ""), query), reverse=True)
+    scored = sorted(
+        entries,
+        key=lambda e: _best_match_score(e.get("title", ""), query),
+        reverse=True,
+    )
     best = scored[0]
     url = best.get("url") or best.get("webpage_url", "")
     if not url:
@@ -2315,7 +2553,11 @@ def _try_youtube_music(query: str):
     entries = [e for e in (flat_info or {}).get("entries", []) if e]
     if not entries:
         raise RuntimeError("Нет результатов на YouTube")
-    scored = sorted(entries, key=lambda e: _best_match_score(e.get("title", ""), query), reverse=True)
+    scored = sorted(
+        entries,
+        key=lambda e: _best_match_score(e.get("title", ""), query),
+        reverse=True,
+    )
     best = scored[0]
     url = best.get("url") or best.get("webpage_url", "")
     if not url:
@@ -2411,8 +2653,7 @@ async def music_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args).strip()
     if not query:
         await update.message.reply_text(
-            "🎵 Напиши запрос после команды.\n"
-            "Пример: /music The Beatles - Hey Jude"
+            "🎵 Напиши запрос после команды.\nПример: /music The Beatles - Hey Jude"
         )
         return
 
@@ -2424,11 +2665,18 @@ async def music_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timeout=150,
         )
         audio_bytes, title, artist = result
-        music_search_state[user_id] = {"candidates": candidates, "idx": used_idx, "query": query}
+        music_search_state[user_id] = {
+            "candidates": candidates,
+            "idx": used_idx,
+            "query": query,
+        }
         await msg.edit_text("📤 Загружаю файл…")
         await _safe_send_audio(
-            update.message, audio_bytes,
-            filename=f"{title}.mp3", title=title, performer=artist,
+            update.message,
+            audio_bytes,
+            filename=f"{title}.mp3",
+            title=title,
+            performer=artist,
             reply_markup=_music_keyboard(),
         )
         await msg.delete()
@@ -2439,6 +2687,7 @@ async def music_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ===== COMMANDS =====
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -2460,7 +2709,6 @@ async def groq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚡ Groq активирован", reply_markup=main_keyboard())
 
 
-
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     with _memory_lock:
@@ -2469,27 +2717,29 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _font_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("Regular", callback_data="fs:Regular"),
-            InlineKeyboardButton("Bold", callback_data="fs:Bold"),
-        ],
-        [
-            InlineKeyboardButton("Italic", callback_data="fs:Italic"),
-            InlineKeyboardButton("Bold Italic", callback_data="fs:BoldItalic"),
-        ],
-        [
-            InlineKeyboardButton("Light", callback_data="fs:Light"),
-            InlineKeyboardButton("SemiBold", callback_data="fs:SemiBold"),
-        ],
-        [
-            InlineKeyboardButton("Thin", callback_data="fs:Thin"),
-            InlineKeyboardButton("Black", callback_data="fs:Black"),
-        ],
-        [
-            InlineKeyboardButton("📦 Все начертания (ZIP)", callback_data="fs:all"),
-        ],
-    ])
+            [
+                InlineKeyboardButton("Regular", callback_data="fs:Regular"),
+                InlineKeyboardButton("Bold", callback_data="fs:Bold"),
+            ],
+            [
+                InlineKeyboardButton("Italic", callback_data="fs:Italic"),
+                InlineKeyboardButton("Bold Italic", callback_data="fs:BoldItalic"),
+            ],
+            [
+                InlineKeyboardButton("Light", callback_data="fs:Light"),
+                InlineKeyboardButton("SemiBold", callback_data="fs:SemiBold"),
+            ],
+            [
+                InlineKeyboardButton("Thin", callback_data="fs:Thin"),
+                InlineKeyboardButton("Black", callback_data="fs:Black"),
+            ],
+            [
+                InlineKeyboardButton("📦 Все начертания (ZIP)", callback_data="fs:all"),
+            ],
+        ]
+    )
 
 
 async def font_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2508,11 +2758,12 @@ async def font_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Выбери начертание или нажми «Все начертания» для ZIP-архива.\n"
         "Можно также написать своё, например: ExtraLight Italic",
         parse_mode="Markdown",
-        reply_markup=_font_keyboard()
+        reply_markup=_font_keyboard(),
     )
 
 
 # ===== BUTTON CALLBACKS =====
+
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2566,13 +2817,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query.message.reply_video,
             query.message.reply_document,
             query.message.reply_text,
-            user_id, status,
+            user_id,
+            status,
         )
 
     elif query.data == "next_music":
         state = music_search_state.get(user_id)
         if not state:
-            await query.message.reply_text("⚠ Нет активного поиска музыки. Отправь новый запрос.")
+            await query.message.reply_text(
+                "⚠ Нет активного поиска музыки. Отправь новый запрос."
+            )
             return
         candidates = state.get("candidates", [])
         idx = state.get("idx", 0) + 1
@@ -2588,13 +2842,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await status.edit_text(f"⬇️ Скачиваю: «{cand['title'][:50]}»…")
                 audio_bytes, title, artist = await asyncio.wait_for(
-                    loop.run_in_executor(_EXECUTOR, download_music_from_candidate, cand),
+                    loop.run_in_executor(
+                        _EXECUTOR, download_music_from_candidate, cand
+                    ),
                     timeout=120,
                 )
                 await status.edit_text("📤 Загружаю…")
                 await _safe_send_audio(
-                    query.message, audio_bytes,
-                    filename=f"{title}.mp3", title=title, performer=artist,
+                    query.message,
+                    audio_bytes,
+                    filename=f"{title}.mp3",
+                    title=title,
+                    performer=artist,
                     reply_markup=_music_keyboard(),
                 )
                 await status.delete()
@@ -2612,8 +2871,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await status.edit_text("🔍 Ищу ещё треки…")
                 extra = await loop.run_in_executor(
-                    _EXECUTOR, search_music_candidates,
-                    original_query + " alternative" if original_query else original_query
+                    _EXECUTOR,
+                    search_music_candidates,
+                    original_query + " alternative"
+                    if original_query
+                    else original_query,
                 )
                 # Filter already-seen
                 seen_urls = {c["url"] for c in candidates}
@@ -2624,21 +2886,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     state["idx"] = len(candidates)
                     await status.edit_text(f"⬇️ Скачиваю: «{cand['title'][:50]}»…")
                     audio_bytes, title, artist = await asyncio.wait_for(
-                        loop.run_in_executor(_EXECUTOR, download_music_from_candidate, cand),
+                        loop.run_in_executor(
+                            _EXECUTOR, download_music_from_candidate, cand
+                        ),
                         timeout=120,
                     )
                     await status.edit_text("📤 Загружаю…")
                     await _safe_send_audio(
-                        query.message, audio_bytes,
-                        filename=f"{title}.mp3", title=title, performer=artist,
+                        query.message,
+                        audio_bytes,
+                        filename=f"{title}.mp3",
+                        title=title,
+                        performer=artist,
                         reply_markup=_music_keyboard(),
                     )
                     await status.delete()
                 else:
-                    await status.edit_text("😔 Больше вариантов нет. Попробуй другой запрос.")
+                    await status.edit_text(
+                        "😔 Больше вариантов нет. Попробуй другой запрос."
+                    )
                     music_search_state.pop(user_id, None)
             except Exception as e:
-                await status.edit_text(f"😔 Больше вариантов нет. Попробуй другой запрос.")
+                await status.edit_text(
+                    f"😔 Больше вариантов нет. Попробуй другой запрос."
+                )
 
     elif query.data.startswith("fs:"):
         style = query.data[3:]
@@ -2649,8 +2920,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         if style == "all":
             msg = await query.message.reply_text(
-                f"📦 Скачиваю все начертания *{font_name}*...",
-                parse_mode="Markdown"
+                f"📦 Скачиваю все начертания *{font_name}*...", parse_mode="Markdown"
             )
             try:
                 filename, file_bytes = await loop.run_in_executor(
@@ -2659,7 +2929,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_document(
                     document=io.BytesIO(file_bytes),
                     filename=filename,
-                    caption=f"✅ {font_name} — все начертания\n🆓 Источник: Google Fonts / DaFont"
+                    caption=f"✅ {font_name} — все начертания\n🆓 Источник: Google Fonts / DaFont",
                 )
                 await msg.delete()
             except Exception as e:
@@ -2667,7 +2937,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             msg = await query.message.reply_text(
                 f"🔍 Ищу шрифт *{font_name}* — начертание *{style}*...",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
             try:
                 filename, file_bytes = await loop.run_in_executor(
@@ -2676,7 +2946,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_document(
                     document=io.BytesIO(file_bytes),
                     filename=filename,
-                    caption=f"✅ {font_name} — {style}\n🆓 Источник: Google Fonts (бесплатный некоммерческий шрифт)"
+                    caption=f"✅ {font_name} — {style}\n🆓 Источник: Google Fonts (бесплатный некоммерческий шрифт)",
                 )
                 await msg.delete()
             except Exception as e:
@@ -2684,6 +2954,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ===== VIDEO SEARCH HANDLER =====
+
 
 async def _handle_video_search(update: Update, query: str):
     """Search multiple platforms and send the first downloadable video."""
@@ -2708,7 +2979,12 @@ async def _handle_video_search(update: Update, query: str):
         with _memory_lock:
             history = user_memory.get(user_id, [])
             history.append({"role": "user", "content": f"найди видео {query}"})
-            history.append({"role": "assistant", "content": f"Поискал видео «{query}» на YouTube, Dailymotion, Rutube и Vimeo — вообще ничего не нашёл. Попробуй переформулировать запрос или уточни что именно хочешь посмотреть."})
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": f"Поискал видео «{query}» на YouTube, Dailymotion, Rutube и Vimeo — вообще ничего не нашёл. Попробуй переформулировать запрос или уточни что именно хочешь посмотреть.",
+                }
+            )
             user_memory[user_id] = history[-10:]
         return
 
@@ -2719,13 +2995,18 @@ async def _handle_video_search(update: Update, query: str):
         "sent_ids": set(),
     }
 
-    await _send_next_video(update.message.reply_video,
-                           update.message.reply_document,
-                           update.message.reply_text,
-                           user_id, status)
+    await _send_next_video(
+        update.message.reply_video,
+        update.message.reply_document,
+        update.message.reply_text,
+        user_id,
+        status,
+    )
 
 
-async def _send_next_video(reply_video_fn, reply_doc_fn, reply_text_fn, user_id: int, status_msg):
+async def _send_next_video(
+    reply_video_fn, reply_doc_fn, reply_text_fn, user_id: int, status_msg
+):
     """Try platforms one by one until a video is sent or all options exhausted."""
     state = video_search_state.get(user_id)
     if not state:
@@ -2770,7 +3051,7 @@ async def _send_next_video(reply_video_fn, reply_doc_fn, reply_text_fn, user_id:
         platform = entry.get("platform", "")
         title = entry.get("title", "")
         dur = entry.get("duration") or 0
-        dur_str = f"{int(dur)//60}:{int(dur)%60:02d}" if dur else "?"
+        dur_str = f"{int(dur) // 60}:{int(dur) % 60:02d}" if dur else "?"
 
         # Skip YouTube entries quickly if it was already blocked by auth
         if yt_blocked and platform == "YouTube":
@@ -2781,22 +3062,20 @@ async def _send_next_video(reply_video_fn, reply_doc_fn, reply_text_fn, user_id:
         if platform not in tried_platforms:
             tried_platforms.add(platform)
             try:
-                await status_msg.edit_text(
-                    f"🔍 Пробую {platform}…\n🎬 {title[:60]}"
-                )
+                await status_msg.edit_text(f"🔍 Пробую {platform}…\n🎬 {title[:60]}")
             except Exception:
                 pass
         else:
             try:
-                await status_msg.edit_text(
-                    f"⬇️ Скачиваю с {platform}…\n🎬 {title[:60]}"
-                )
+                await status_msg.edit_text(f"⬇️ Скачиваю с {platform}…\n🎬 {title[:60]}")
             except Exception:
                 pass
 
         try:
             vid_bytes, vid_title = await asyncio.wait_for(
-                loop.run_in_executor(_EXECUTOR, _download_video_url, entry["url"], title),
+                loop.run_in_executor(
+                    _EXECUTOR, _download_video_url, entry["url"], title
+                ),
                 timeout=60,
             )
         except asyncio.TimeoutError:
@@ -2806,7 +3085,10 @@ async def _send_next_video(reply_video_fn, reply_doc_fn, reply_text_fn, user_id:
             err_str = str(_ve).lower()
             if platform == "YouTube" and any(k in err_str for k in _YT_BOT_ERRORS):
                 yt_blocked = True
-                print(f"[video] YouTube auth blocked, skipping remaining YT entries", flush=True)
+                print(
+                    f"[video] YouTube auth blocked, skipping remaining YT entries",
+                    flush=True,
+                )
             else:
                 print(f"[video] fail ({platform}): {str(_ve)[:120]}", flush=True)
             continue
@@ -2814,10 +3096,11 @@ async def _send_next_video(reply_video_fn, reply_doc_fn, reply_text_fn, user_id:
         # Success — send the video
         size_mb = len(vid_bytes) / (1024 * 1024)
         caption = (
-            f"🎬 {vid_title or title}\n"
-            f"⏱ {dur_str}  💾 {size_mb:.1f} МБ  📺 {platform}"
+            f"🎬 {vid_title or title}\n⏱ {dur_str}  💾 {size_mb:.1f} МБ  📺 {platform}"
         )
-        safe_name = re.sub(r'[^\w\s-]', '', title)[:40].strip().replace(' ', '_') or "video"
+        safe_name = (
+            re.sub(r"[^\w\s-]", "", title)[:40].strip().replace(" ", "_") or "video"
+        )
 
         try:
             await status_msg.edit_text("📤 Отправляю…")
@@ -2838,7 +3121,10 @@ async def _send_next_video(reply_video_fn, reply_doc_fn, reply_text_fn, user_id:
                 )
             except Exception as e:
                 # File too large for Telegram — try next entry
-                print(f"[video] telegram send failed ({platform}): {str(e)[:120]}", flush=True)
+                print(
+                    f"[video] telegram send failed ({platform}): {str(e)[:120]}",
+                    flush=True,
+                )
                 try:
                     await status_msg.edit_text(
                         f"⚠ Файл слишком большой ({size_mb:.0f} МБ), ищу другой вариант…"
@@ -2928,6 +3214,7 @@ async def _safe_send_doc(
 
 # ===== CHAT =====
 
+
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     text = update.message.text.strip()
@@ -2945,14 +3232,17 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if fps <= 0:
                     raise ValueError()
             except ValueError:
-                await update.message.reply_text("⚠ Введи корректное число, например `0.5` или `1`", parse_mode="Markdown")
+                await update.message.reply_text(
+                    "⚠ Введи корректное число, например `0.5` или `1`",
+                    parse_mode="Markdown",
+                )
                 return
             state["fps"] = fps
             state["step"] = "maxsize"
             await update.message.reply_text(
                 "📏 До какого веса (в КБ) сжать каждый GIF?\n"
                 "Напиши число, например: `200` или `500`",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
             return
         elif state["step"] == "maxsize":
@@ -2961,7 +3251,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if max_kb <= 0:
                     raise ValueError()
             except ValueError:
-                await update.message.reply_text("⚠ Введи целое число в КБ, например `200`", parse_mode="Markdown")
+                await update.message.reply_text(
+                    "⚠ Введи целое число в КБ, например `200`", parse_mode="Markdown"
+                )
                 return
             pending = gif_pending.pop(user_id)
             zip_bytes = pending["zip_bytes"]
@@ -2982,7 +3274,8 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 names_list = "\n".join(f"• {n}" for n in created)
                 await _safe_send_doc(
-                    update.message, result_zip,
+                    update.message,
+                    result_zip,
                     filename="gifs.zip",
                     caption=f"✅ Готово! Создано GIF-файлов: {len(created)}\n{names_list}",
                 )
@@ -2998,8 +3291,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         if style.lower() in ("все", "all", "всё"):
             msg = await update.message.reply_text(
-                f"📦 Скачиваю все начертания *{font_name}*...",
-                parse_mode="Markdown"
+                f"📦 Скачиваю все начертания *{font_name}*...", parse_mode="Markdown"
             )
             try:
                 filename, file_bytes = await loop.run_in_executor(
@@ -3008,7 +3300,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(
                     document=io.BytesIO(file_bytes),
                     filename=filename,
-                    caption=f"✅ {font_name} — все начертания\n🆓 Источник: Google Fonts / DaFont"
+                    caption=f"✅ {font_name} — все начертания\n🆓 Источник: Google Fonts / DaFont",
                 )
                 await msg.delete()
             except Exception as e:
@@ -3016,7 +3308,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             msg = await update.message.reply_text(
                 f"🔍 Ищу шрифт *{font_name}* — начертание *{style}*...",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
             try:
                 filename, file_bytes = await loop.run_in_executor(
@@ -3025,7 +3317,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(
                     document=io.BytesIO(file_bytes),
                     filename=filename,
-                    caption=f"✅ {font_name} — {style}\n🆓 Источник: Google Fonts (бесплатный некоммерческий шрифт)"
+                    caption=f"✅ {font_name} — {style}\n🆓 Источник: Google Fonts (бесплатный некоммерческий шрифт)",
                 )
                 await msg.delete()
             except Exception as e:
@@ -3042,7 +3334,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Выбери начертание или нажми «Все начертания» для ZIP-архива.\n"
             "Можно также написать своё, например: ExtraLight Italic",
             parse_mode="Markdown",
-            reply_markup=_font_keyboard()
+            reply_markup=_font_keyboard(),
         )
         return
 
@@ -3074,11 +3366,18 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 timeout=150,
             )
             audio_bytes, title, artist = result
-            music_search_state[user_id] = {"candidates": candidates, "idx": used_idx, "query": query}
+            music_search_state[user_id] = {
+                "candidates": candidates,
+                "idx": used_idx,
+                "query": query,
+            }
             await msg.edit_text("📤 Загружаю файл…")
             await _safe_send_audio(
-                update.message, audio_bytes,
-                filename=f"{title}.mp3", title=title, performer=artist,
+                update.message,
+                audio_bytes,
+                filename=f"{title}.mp3",
+                title=title,
+                performer=artist,
                 reply_markup=_music_keyboard(),
             )
             await msg.delete()
@@ -3105,10 +3404,15 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await update.message.reply_text(f"🎵 Скачиваю аудио с {source}...")
         try:
             loop = asyncio.get_running_loop()
-            audio_bytes, title, artist = await loop.run_in_executor(_EXECUTOR, download_audio_url, url)
+            audio_bytes, title, artist = await loop.run_in_executor(
+                _EXECUTOR, download_audio_url, url
+            )
             await _safe_send_audio(
-                update.message, audio_bytes,
-                filename=f"{title}.mp3", title=title, performer=artist,
+                update.message,
+                audio_bytes,
+                filename=f"{title}.mp3",
+                title=title,
+                performer=artist,
             )
             await msg.delete()
         except Exception as e:
@@ -3119,7 +3423,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if IMAGE_RE.search(text):
         query = extract_image_query(text)
         if not query:
-            await update.message.reply_text("🔍 Что именно показать? Напиши, например: «покажи закат»")
+            await update.message.reply_text(
+                "🔍 Что именно показать? Напиши, например: «покажи закат»"
+            )
             return
         status = await update.message.reply_text("🔍 Ищу фото…")
         loop = asyncio.get_running_loop()
@@ -3131,7 +3437,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             results = []
         if not results:
-            await status.edit_text("😔 Не удалось найти подходящие фото. Попробуй другой запрос.")
+            await status.edit_text(
+                "😔 Не удалось найти подходящие фото. Попробуй другой запрос."
+            )
             return
         await status.edit_text("📥 Загружаю фото…")
         sent = 0
@@ -3143,6 +3451,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     timeout=8,
                 )
                 from telegram import InputMediaPhoto as _IMP
+
                 media_group.append(
                     _IMP(
                         media=io.BytesIO(img_bytes),
@@ -3155,7 +3464,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if sent >= 4:
                 break
         if not media_group:
-            await status.edit_text(f"😔 Не удалось загрузить фото по запросу «{query}».")
+            await status.edit_text(
+                f"😔 Не удалось загрузить фото по запросу «{query}»."
+            )
             return
         try:
             if len(media_group) == 1:
@@ -3171,19 +3482,27 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Smart internet media search ──────────────────────────────────────────
-    if INTERNET_RE.search(text) or MEDIA_FROM_RE.search(text) or PHOTO_GUIDE_RE.search(text):
+    if (
+        INTERNET_RE.search(text)
+        or MEDIA_FROM_RE.search(text)
+        or PHOTO_GUIDE_RE.search(text)
+    ):
         loop = asyncio.get_running_loop()
         msg = await update.message.reply_text("🔍 Понимаю запрос…")
         try:
             intent_data = await loop.run_in_executor(_EXECUTOR, classify_intent, text)
             intent = intent_data.get("intent", "chat")
-            query  = intent_data.get("query", text)
+            query = intent_data.get("query", text)
 
             if intent == "images":
                 await msg.edit_text(f"🖼 Ищу картинки: «{query}»…")
-                images = await loop.run_in_executor(_EXECUTOR, search_images, query, 5, True)
+                images = await loop.run_in_executor(
+                    _EXECUTOR, search_images, query, 5, True
+                )
                 if not images and query != text:
-                    images = await loop.run_in_executor(_EXECUTOR, search_images, text, 5, True)
+                    images = await loop.run_in_executor(
+                        _EXECUTOR, search_images, text, 5, True
+                    )
                 if not images:
                     await msg.edit_text(
                         "😔 Не удалось найти картинки по этому запросу.\n"
@@ -3191,17 +3510,22 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
                 from telegram import InputMediaPhoto
+
                 media_group = []
                 for i, item in enumerate(images):
                     try:
                         img_bytes = await asyncio.wait_for(
-                            loop.run_in_executor(_EXECUTOR, download_image, item["url"]),
+                            loop.run_in_executor(
+                                _EXECUTOR, download_image, item["url"]
+                            ),
                             timeout=8,
                         )
-                        media_group.append(InputMediaPhoto(
-                            media=io.BytesIO(img_bytes),
-                            caption=f"🔎 {query}" if i == 0 else None,
-                        ))
+                        media_group.append(
+                            InputMediaPhoto(
+                                media=io.BytesIO(img_bytes),
+                                caption=f"🔎 {query}" if i == 0 else None,
+                            )
+                        )
                     except Exception:
                         continue
                     if len(media_group) >= 4:
@@ -3228,14 +3552,23 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text(f"🎵 Ищу музыку: «{query}»…")
                 try:
                     result, candidates, used_idx = await asyncio.wait_for(
-                        loop.run_in_executor(_EXECUTOR, search_and_download_first_music, query),
+                        loop.run_in_executor(
+                            _EXECUTOR, search_and_download_first_music, query
+                        ),
                         timeout=150,
                     )
                     audio_bytes, title, artist = result
-                    music_search_state[user_id] = {"candidates": candidates, "idx": used_idx, "query": query}
+                    music_search_state[user_id] = {
+                        "candidates": candidates,
+                        "idx": used_idx,
+                        "query": query,
+                    }
                     await _safe_send_audio(
-                        update.message, audio_bytes,
-                        filename=f"{title}.mp3", title=title, performer=artist,
+                        update.message,
+                        audio_bytes,
+                        filename=f"{title}.mp3",
+                        title=title,
+                        performer=artist,
                         reply_markup=_music_keyboard(),
                     )
                     await msg.delete()
@@ -3247,7 +3580,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if intent == "info":
                 await msg.edit_text(f"🔍 Ищу информацию: «{query}»…")
-                answer, image_query = await loop.run_in_executor(_EXECUTOR, search_web_info, query)
+                answer, image_query = await loop.run_in_executor(
+                    _EXECUTOR, search_web_info, query
+                )
                 if not answer:
                     await msg.edit_text(
                         "😔 Не нашёл актуальной информации по этому запросу.\n"
@@ -3259,17 +3594,24 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     await msg.edit_text(answer)
                 if image_query:
-                    imgs = await loop.run_in_executor(_EXECUTOR, search_images, image_query, 3)
+                    imgs = await loop.run_in_executor(
+                        _EXECUTOR, search_images, image_query, 3
+                    )
                     if imgs:
                         from telegram import InputMediaPhoto
+
                         media = []
                         for item in imgs:
                             try:
                                 img_bytes = await asyncio.wait_for(
-                                    loop.run_in_executor(_EXECUTOR, download_image, item["url"]),
+                                    loop.run_in_executor(
+                                        _EXECUTOR, download_image, item["url"]
+                                    ),
                                     timeout=8,
                                 )
-                                media.append(InputMediaPhoto(media=io.BytesIO(img_bytes)))
+                                media.append(
+                                    InputMediaPhoto(media=io.BytesIO(img_bytes))
+                                )
                             except Exception:
                                 continue
                         if media:
@@ -3288,7 +3630,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── Direct info search (расписания, факты, локальные запросы, вопросы с ?) ──
-    is_question = text.rstrip().endswith('?')
+    is_question = text.rstrip().endswith("?")
     if INFO_RE.search(text) or is_question:
         loop = asyncio.get_running_loop()
         msg = await update.message.reply_text("🔍 Ищу актуальную информацию…")
@@ -3312,17 +3654,24 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         await msg.edit_text(answer)
                     if image_query:
-                        imgs = await loop.run_in_executor(_EXECUTOR, search_images, image_query, 3)
+                        imgs = await loop.run_in_executor(
+                            _EXECUTOR, search_images, image_query, 3
+                        )
                         if imgs:
                             from telegram import InputMediaPhoto
+
                             media = []
                             for item in imgs:
                                 try:
                                     img_bytes = await asyncio.wait_for(
-                                        loop.run_in_executor(_EXECUTOR, download_image, item["url"]),
+                                        loop.run_in_executor(
+                                            _EXECUTOR, download_image, item["url"]
+                                        ),
                                         timeout=8,
                                     )
-                                    media.append(InputMediaPhoto(media=io.BytesIO(img_bytes)))
+                                    media.append(
+                                        InputMediaPhoto(media=io.BytesIO(img_bytes))
+                                    )
                                 except Exception:
                                     continue
                             if media:
@@ -3343,13 +3692,16 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     system_extra = ""
     try:
-        answer = await loop.run_in_executor(_EXECUTOR, ask_groq, user_id, text, system_extra)
+        answer = await loop.run_in_executor(
+            _EXECUTOR, ask_groq, user_id, text, system_extra
+        )
         await update.message.reply_text(answer, reply_markup=main_keyboard())
     except Exception as e:
         await update.message.reply_text(f"⚠ Ошибка: {e}")
 
 
 # ===== GIF BUILDER =====
+
 
 def _make_gif(frames: list, duration_ms: int, max_kb: int) -> bytes:
     max_bytes = max_kb * 1024
@@ -3361,12 +3713,18 @@ def _make_gif(frames: list, duration_ms: int, max_kb: int) -> bytes:
             rgba = img.convert("RGBA")
             background = Image.new("RGB", rgba.size, (255, 255, 255))
             background.paste(rgba, mask=rgba.split()[3])
-            q = background.quantize(colors=n_colors, method=Image.Quantize.MEDIANCUT, dither=0)
+            q = background.quantize(
+                colors=n_colors, method=Image.Quantize.MEDIANCUT, dither=0
+            )
             processed.append(q)
         processed[0].save(
-            buf, format="GIF", save_all=True,
+            buf,
+            format="GIF",
+            save_all=True,
             append_images=processed[1:],
-            duration=duration_ms, loop=0, optimize=True
+            duration=duration_ms,
+            loop=0,
+            optimize=True,
         )
         return buf.getvalue()
 
@@ -3377,7 +3735,9 @@ def _make_gif(frames: list, duration_ms: int, max_kb: int) -> bytes:
     return render(frames, 2)
 
 
-def build_gifs_from_zip(zip_bytes: bytes, fps: float, max_kb: int) -> tuple[bytes, list[str]]:
+def build_gifs_from_zip(
+    zip_bytes: bytes, fps: float, max_kb: int
+) -> tuple[bytes, list[str]]:
     duration_ms = max(1, int(fps * 1000))
     src = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
 
@@ -3389,11 +3749,13 @@ def build_gifs_from_zip(zip_bytes: bytes, fps: float, max_kb: int) -> tuple[byte
         ext = os.path.splitext(fname)[1].lower()
         if ext not in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}:
             continue
-        m = re.match(r'^(.+?)_(\d+)(\.[^.]+)$', fname)
+        m = re.match(r"^(.+?)_(\d+)(\.[^.]+)$", fname)
         if m:
             base = m.group(1)
             idx = int(m.group(2))
-            groups.setdefault(base, []).append((idx, item.filename, src.read(item.filename)))
+            groups.setdefault(base, []).append(
+                (idx, item.filename, src.read(item.filename))
+            )
 
     out_buf = io.BytesIO()
     created: list[str] = []
@@ -3461,7 +3823,6 @@ def rename_zip_by_dimensions(zip_bytes: bytes) -> tuple[bytes, int, int]:
     return out_buf.read(), total, renamed
 
 
-
 async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle images sent as files (uncompressed documents)."""
     doc = update.message.document
@@ -3485,15 +3846,19 @@ async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_T
             fmt = "PNG"
             if size_mb > 45:
                 from PIL import Image as _Image
+
                 img_big = _Image.open(io.BytesIO(result_bytes))
                 buf2 = io.BytesIO()
-                img_big.convert("RGB").save(buf2, format="JPEG", quality=95, optimize=True)
+                img_big.convert("RGB").save(
+                    buf2, format="JPEG", quality=95, optimize=True
+                )
                 result_bytes = buf2.getvalue()
                 size_mb = len(result_bytes) / (1024 * 1024)
                 filename = "upscaled_3x.jpg"
                 fmt = "JPEG"
             await _safe_send_doc(
-                update.message, result_bytes,
+                update.message,
+                result_bytes,
                 filename=filename,
                 caption=(
                     f"✅ Готово! Увеличено в 3x ({fmt})\n"
@@ -3512,7 +3877,9 @@ async def image_document_handler(update: Update, context: ContextTypes.DEFAULT_T
             dl = io.BytesIO()
             await file.download_to_memory(dl)
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(_EXECUTOR, analyze_text_percentage, dl.getvalue())
+            result = await loop.run_in_executor(
+                _EXECUTOR, analyze_text_percentage, dl.getvalue()
+            )
             await update.message.reply_text(f"📊 {result}")
             await msg.delete()
         except Exception as e:
@@ -3662,7 +4029,11 @@ async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         err_str = str(e)
         size_mb = (doc.file_size or 0) / (1024 * 1024)
-        if "too big" in err_str.lower() or "file is too big" in err_str.lower() or size_mb > 20:
+        if (
+            "too big" in err_str.lower()
+            or "file is too big" in err_str.lower()
+            or size_mb > 20
+        ):
             await msg.edit_text(
                 f"⚠ Архив {size_mb:.0f} МБ — Telegram не позволяет ботам скачивать файлы >20 МБ.\n"
                 "Уменьши архив и пришли заново."
@@ -3677,9 +4048,8 @@ async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if GIF_CMD_RE.search(caption):
         gif_pending[user_id] = {"zip_bytes": zip_bytes, "step": "fps"}
         await msg.edit_text(
-            "⏱ Сколько секунд на один кадр?\n"
-            "Напиши число, например: `0.5` или `1`",
-            parse_mode="Markdown"
+            "⏱ Сколько секунд на один кадр?\nНапиши число, например: `0.5` или `1`",
+            parse_mode="Markdown",
         )
         return
 
@@ -3695,9 +4065,14 @@ async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await msg.edit_text("⚠ В архиве не найдено ни одного изображения.")
                 return
             target_kb = target_bytes / 1024
-            target_str = f"{target_kb / 1024:.1f} МБ" if target_kb >= 1024 else f"{target_kb:.0f} КБ"
+            target_str = (
+                f"{target_kb / 1024:.1f} МБ"
+                if target_kb >= 1024
+                else f"{target_kb:.0f} КБ"
+            )
             await _safe_send_doc(
-                update.message, result_bytes,
+                update.message,
+                result_bytes,
                 filename=f"{original_name}_compressed.zip",
                 caption=(
                     f"✅ Готово!\n"
@@ -3718,7 +4093,8 @@ async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             None, rename_zip_by_dimensions, zip_bytes
         )
         await _safe_send_doc(
-            update.message, result_bytes,
+            update.message,
+            result_bytes,
             filename=f"{original_name}_renamed.zip",
             caption=f"✅ Готово: {renamed} из {total} файлов переименованы по размеру в пикселях",
         )
@@ -3729,9 +4105,11 @@ async def zip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ===== START BOT =====
 
+
 async def _on_startup(application):
     """In polling mode: drop any active webhook. In webhook mode: start keep-alive task."""
     import asyncio as _asyncio
+
     if os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
         # In webhook mode, run_webhook will set the webhook itself.
         # Spawn keep-alive task so Render free instance never sleeps.
@@ -3747,7 +4125,7 @@ async def _on_startup(application):
                 print("✅ Webhook deleted, polling mode active", flush=True)
                 return
         except Exception as e:
-            print(f"[startup] delete_webhook attempt {attempt+1}: {e}", flush=True)
+            print(f"[startup] delete_webhook attempt {attempt + 1}: {e}", flush=True)
         await _asyncio.sleep(2)
     print("⚠ Could not confirm webhook deletion after 5 attempts", flush=True)
 
@@ -3759,6 +4137,7 @@ async def _keep_alive_loop():
     answers instantly at any time of day.
     """
     import asyncio as _asyncio
+
     host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
     if not host:
         return
@@ -3767,6 +4146,7 @@ async def _keep_alive_loop():
 
     try:
         import aiohttp  # type: ignore
+
         use_aiohttp = True
     except Exception:
         use_aiohttp = False
@@ -3776,22 +4156,31 @@ async def _keep_alive_loop():
         try:
             if use_aiohttp:
                 import aiohttp  # type: ignore
+
                 timeout = aiohttp.ClientTimeout(total=20)
                 async with aiohttp.ClientSession(timeout=timeout) as sess:
                     async with sess.get(ping_url) as resp:
-                        print(f"💓 keep-alive ping {ping_url} -> {resp.status}", flush=True)
+                        print(
+                            f"💓 keep-alive ping {ping_url} -> {resp.status}",
+                            flush=True,
+                        )
             else:
+
                 def _ping():
                     try:
                         with urllib.request.urlopen(ping_url, timeout=20) as r:
                             return r.status
                     except Exception as e:
                         return f"err:{e}"
-                status = await _asyncio.get_running_loop().run_in_executor(_EXECUTOR, _ping)
+
+                status = await _asyncio.get_running_loop().run_in_executor(
+                    _EXECUTOR, _ping
+                )
                 print(f"💓 keep-alive ping {ping_url} -> {status}", flush=True)
         except Exception as e:
             print(f"[keep-alive] error: {e}", flush=True)
         await _asyncio.sleep(interval)
+
 
 app = (
     ApplicationBuilder()
@@ -3806,6 +4195,7 @@ app = (
 )
 
 _last_webhook_delete: float = 0.0
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     import traceback, time as _time
@@ -3824,13 +4214,18 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return  # don't log full traceback for Conflict
 
-    err_text = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
+    err_text = "".join(
+        traceback.format_exception(
+            type(context.error), context.error, context.error.__traceback__
+        )
+    )
     print(f"[ERROR] {err_text}", flush=True)
     if update and hasattr(update, "message") and update.message:
         try:
             await update.message.reply_text("⚠ Что-то пошло не так, попробуй ещё раз.")
         except Exception:
             pass
+
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("menu", menu_cmd))
@@ -3844,7 +4239,9 @@ app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 app.add_handler(MessageHandler(filters.VIDEO, video_handler))
 app.add_handler(MessageHandler(filters.Document.VIDEO, video_handler))
 app.add_handler(MessageHandler(filters.Document.IMAGE, image_document_handler))
-app.add_handler(MessageHandler(filters.Document.FileExtension("zip"), zip_rename_handler))
+app.add_handler(
+    MessageHandler(filters.Document.FileExtension("zip"), zip_rename_handler)
+)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 app.add_error_handler(error_handler)
 
